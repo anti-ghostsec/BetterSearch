@@ -95,6 +95,18 @@ impl Realbooru {
 				categories.insert("general".to_string(), tags.clone());
 			}
 			let dir = dir_of(&src).unwrap_or_default();
+			// The site marks moving pictures with a tag; without it the viewer
+			// would treat a video as a still.
+			// `animated` is nearly always a GIF (plays on its own); `video`
+			// alone is usually MP4. Guessing wrong only costs 404s, since the
+			// fetch tries the others.
+			let ext = if tags.iter().any(|t| t == "animated") {
+				"gif"
+			} else if tags.iter().any(|t| t == "video" || t == "webm" || t == "mp4") {
+				"mp4"
+			} else {
+				"jpg"
+			};
 			out.push(Post {
 				site: "realbooru".into(),
 				id,
@@ -105,10 +117,10 @@ impl Realbooru {
 				fav_count: 0,
 				width: 0,
 				height: 0,
-				ext: "jpg".into(),
+				ext: ext.into(),
 				md5: Some(md5.clone()),
 				// Guessed extension; `fetch_bytes` corrects it by trying in turn.
-				file_url: Some(format!("{0}//images/{dir}/{md5}.jpg", self.base)),
+				file_url: Some(format!("{0}//images/{dir}/{md5}.{ext}", self.base)),
 				sample_url: None,
 				preview_url: Some(src.clone()),
 				page_url: format!("{}/index.php?page=post&s=view&id={id}", self.base),
@@ -217,8 +229,13 @@ impl Site for Realbooru {
 			return super::download_with(&self.client, url, Some(&format!("{}/", self.base)));
 		}
 		let stem = url.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or_else(|| url.to_string());
+		// Whatever the post claimed is tried first; a video should not pay for
+		// four 404s before its own extension.
+		let claimed = url.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+		let mut order: Vec<&str> = EXTS.to_vec();
+		order.sort_by_key(|e| *e != claimed);
 		let mut last = None;
-		for ext in EXTS {
+		for ext in order {
 			match super::download_with(&self.client, &format!("{stem}.{ext}"), Some(&format!("{}/", self.base))) {
 				Ok(bytes) => return Ok(bytes),
 				Err(e) => last = Some(e),

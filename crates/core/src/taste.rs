@@ -347,6 +347,65 @@ pub fn brief(endpoint: &str, key: &str, model: &str, tags: &[String], ratings: &
 	Ok(text)
 }
 
+/// Models the endpoint offers, so the picker can list real ones.
+pub fn models(endpoint: &str, key: &str) -> Result<Vec<String>> {
+	let url = format!("{}/models", endpoint.trim_end_matches('/'));
+	let client = reqwest::blocking::Client::builder()
+		.timeout(std::time::Duration::from_secs(20))
+		.build()
+		.map_err(|e| crate::Error::Query(e.to_string()))?;
+	let mut req = client.get(&url);
+	if !key.trim().is_empty() {
+		req = req.bearer_auth(key.trim());
+	}
+	let res = req.send().map_err(|e| crate::Error::Query(format!("unreachable: {e}")))?;
+	if !res.status().is_success() {
+		return Err(crate::Error::Query(format!("the model list said {}", res.status())));
+	}
+	let value: serde_json::Value = res.json().map_err(|e| crate::Error::Query(e.to_string()))?;
+	let list = value["data"].as_array().or_else(|| value.as_array()).cloned().unwrap_or_default();
+	let ids: Vec<String> = list.iter().filter_map(|m| m["id"].as_str().or_else(|| m.as_str()).map(str::to_string)).collect();
+	if ids.is_empty() {
+		return Err(crate::Error::Query("the endpoint listed no models".into()));
+	}
+	Ok(ids)
+}
+
+/// One chat turn: system, then what the visitor typed. Returned as written.
+pub fn chat(endpoint: &str, key: &str, model: &str, system: &str, text: &str) -> Result<String> {
+	if model.trim().is_empty() {
+		return Err(crate::Error::Query("choose a model first".into()));
+	}
+	let body = serde_json::json!({
+		"model": model,
+		"max_tokens": 400,
+		"temperature": 0.7,
+		"messages": [
+			{ "role": "system", "content": system },
+			{ "role": "user", "content": text },
+		]
+	});
+	let client = reqwest::blocking::Client::builder()
+		.timeout(std::time::Duration::from_secs(60))
+		.build()
+		.map_err(|e| crate::Error::Query(e.to_string()))?;
+	let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+	let mut req = client.post(&url).json(&body);
+	if !key.trim().is_empty() {
+		req = req.bearer_auth(key.trim());
+	}
+	let res = req.send().map_err(|e| crate::Error::Query(format!("model unreachable: {e}")))?;
+	if !res.status().is_success() {
+		return Err(crate::Error::Query(format!("the model said {}", res.status())));
+	}
+	let value: serde_json::Value = res.json().map_err(|e| crate::Error::Query(e.to_string()))?;
+	let text = value["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string();
+	if text.is_empty() {
+		return Err(crate::Error::Query("the model answered nothing".into()));
+	}
+	Ok(text)
+}
+
 /// `rank`s used by the app to order `why` chips: character, species, general.
 pub fn anchor_rank(category: Category) -> u8 {
 	category.rank()

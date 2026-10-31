@@ -70,12 +70,32 @@ pub fn set_tag(query: &str, tag: &str, state: Option<bool>) -> String {
 	words.join(" ")
 }
 
-#[derive(Default)]
+impl Default for TagsPanel {
+	fn default() -> Self {
+		TagsPanel {
+			filter: String::new(),
+			all: false,
+			made_for: (0, 0, 0),
+			last: std::time::Instant::now() - std::time::Duration::from_secs(5),
+			stats: Vec::new(),
+			links: Vec::new(),
+			usual: Vec::new(),
+			recent: Vec::new(),
+			groups: Vec::new(),
+			saved: Vec::new(),
+			relations: Vec::new(),
+			confirm: None,
+		}
+	}
+}
+
 pub struct TagsPanel {
 	filter: String,
 	all: bool,
 	/// (generation, posts, store changes) the cached lists were made for.
 	made_for: (u64, usize, u64),
+	/// When the lists were last rebuilt, to keep it off every frame.
+	last: std::time::Instant,
 	stats: Vec<TagStat>,
 	links: Vec<(String, Vec<String>, usize)>,
 	usual: Vec<(String, usize)>,
@@ -96,6 +116,12 @@ impl TagsPanel {
 		if key == self.made_for {
 			return;
 		}
+		// `changes` ticks on every post written, so without a delay the whole
+		// tag list is rebuilt dozens of times while a first page loads.
+		if self.last.elapsed() < std::time::Duration::from_millis(400) && key.1 == self.made_for.1 {
+			return;
+		}
+		self.last = std::time::Instant::now();
 		if (key.0, key.1) != (self.made_for.0, self.made_for.1) {
 			self.stats = result_tags(posts);
 		}

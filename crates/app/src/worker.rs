@@ -34,6 +34,10 @@ pub enum Msg {
 	Image { url: String, image: Result<ColorImage, String> },
 	Animation { url: String, frames: Result<media::Frames, String> },
 	Video { url: String, video: Result<Box<Video>, String> },
+	/// A chat turn came back, or why it didn't.
+	Chat(Result<String, String>),
+	/// The endpoint's model list, or why it didn't come.
+	Models(Result<Vec<String>, String>),
 	/// A taste brief came back, or why it didn't.
 	Brief(Result<String, String>),
 	/// A file was written to disk, or why it wasn't.
@@ -120,6 +124,26 @@ impl Worker {
 	}
 
 	/// Downloads a GIF (all frames) or a video (into memory, ready to play).
+	/// Asks the endpoint which models it has.
+	pub fn models(&self, endpoint: String, key: String) {
+		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+		std::thread::spawn(move || {
+			let got = bettersearch_core::taste::models(&endpoint, &key).map_err(|e| e.to_string());
+			let _ = tx.send(Msg::Models(got));
+			ctx.request_repaint();
+		});
+	}
+
+	/// One chat turn with the guide, off the UI thread.
+	pub fn chat(&self, endpoint: String, key: String, model: String, system: String, text: String) {
+		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+		std::thread::spawn(move || {
+			let got = bettersearch_core::taste::chat(&endpoint, &key, &model, &system, &text).map_err(|e| e.to_string());
+			let _ = tx.send(Msg::Chat(got));
+			ctx.request_repaint();
+		});
+	}
+
 	/// Asks the model for a brief. Off the UI thread, so typing carries on.
 	pub fn brief(&self, endpoint: String, key: String, model: String, tags: Vec<String>, ratings: Vec<Rating>, dial: f32) {
 		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
@@ -131,7 +155,7 @@ impl Worker {
 	}
 
 	/// Fetches the post's real file (never the thumbnail) and writes it to `dir`.
-	pub fn save(&self, site: Arc<dyn Site>, post: Post, dir: std::path::PathBuf) {
+	pub fn save(&self, site: Arc<dyn Site>, post: Post, dest: std::path::PathBuf) {
 		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
 		std::thread::spawn(move || {
 			let (site_id, id) = (post.site.clone(), post.id);
@@ -141,8 +165,6 @@ impl Worker {
 			match url {
 				None => error = Some("the site sent no file for this post".to_string()),
 				Some(url) => {
-					let ext = url.split('?').next().and_then(|u| u.rsplit_once('.')).map(|(_, e)| e.to_lowercase()).unwrap_or_else(|| post.ext.clone());
-					let dest = dir.join(format!("{site_id}_{id}.{ext}"));
 					match site.fetch_bytes(&url) {
 						Err(e) => error = Some(e.to_string()),
 						Ok(bytes) => match std::fs::write(&dest, &bytes) {

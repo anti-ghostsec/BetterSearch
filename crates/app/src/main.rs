@@ -112,6 +112,8 @@ enum Action {
 	View(usize),
 	/// Writes the post's real file to the downloads folder.
 	Save(usize),
+	/// Switches between the results grid and the Taste tab.
+	TasteTab(bool),
 	CloseViewer,
 	/// Moves to the post this many places on (the one shown large, or selected).
 	Step(i64),
@@ -153,6 +155,14 @@ struct SiteForm {
 	note: Option<String>,
 }
 
+/// The save-as window: where the file goes, and what it's called.
+struct SaveDialog {
+	i: usize,
+	dir: std::path::PathBuf,
+	name: String,
+	error: Option<String>,
+}
+
 struct App {
 	settings: Settings,
 	settings_open: bool,
@@ -167,6 +177,12 @@ struct App {
 	taste_note: Option<String>,
 	file_note: Option<String>,
 	brief_calls: Vec<std::time::Instant>,
+	save_dialog: Option<SaveDialog>,
+	taste_tab: bool,
+	chat: Vec<(bool, String)>,
+	chat_input: String,
+	models: Vec<String>,
+	chat_note: Option<String>,
 	cookie_host: String,
 	cookie_text: String,
 	store: Arc<Mutex<Store>>,
@@ -270,6 +286,12 @@ impl App {
 			taste_note: None,
 			file_note: None,
 			brief_calls: Vec::new(),
+			save_dialog: None,
+			taste_tab: false,
+			chat: Vec::new(),
+			chat_input: String::new(),
+			models: Vec::new(),
+			chat_note: None,
 			cookie_host: String::new(),
 			cookie_text: String::new(),
 			query: settings.last_search.clone(),
@@ -330,22 +352,120 @@ impl App {
 		self.urgent = true;
 	}
 
-	/// Writes the full file (not the thumbnail) to the downloads folder.
-	fn save_post(&mut self, i: usize) {
-		let Some(post) = self.posts.get(i).cloned() else { return };
-		let Some(site) = self.site_by_id(&post.site) else {
-			self.file_note = Some(format!("{} isn't loaded", post.site));
+	/// Sends the typed chat line to the guide.
+	fn send_chat(&mut self) {
+		let text = self.chat_input.trim().to_string();
+		if text.is_empty() {
 			return;
+		}
+		self.chat_input.clear();
+		self.chat.push((true, text.clone()));
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+		let profile = {
+			let store = self.store.lock().unwrap();
+			taste::build(&store, &self.settings.ratings, now, self.settings.taste.dial_override).ok()
 		};
+		let tags: Vec<String> = profile.as_ref().map(|p| p.tags.iter().take(30).map(|t| t.tag.clone()).collect()).unwrap_or_default();
+		let system = format!(
+			"You guide someone through booru searching. Their taste, from their own favorites and searches: {}. Their brief: {}. \
+			 Answer briefly, in plain prose. If a search would help, end with one last line exactly `SEARCH: <query>` using boolean \
+			 syntax (tags ANDed by spaces, `~a ~b` for either, `-tag`, `rating:s|q|e`, `order:score`). Only real tag names.",
+			if tags.is_empty() { "not known yet".to_string() } else { tags.join(", ") },
+			if self.taste_brief.is_empty() { "none yet".to_string() } else { self.taste_brief.clone() },
+		);
+		let t = &self.settings.taste;
+		self.worker.chat(t.endpoint.clone(), t.api_key.clone(), t.model.clone(), system, text);
+	}
+
+	/// The Taste tab: chat with a guide, and the brief.
+	fn taste_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+		ui.horizontal(|ui| {
+			if ui.button("◀ Results").clicked() {
+				actions.push(Action::TasteTab(false));
+			}
+			ui.separator();
+			ui.label("Model");
+			let current = if self.settings.taste.model.is_empty() { "pick one".to_string() } else { self.settings.taste.model.clone() };
+			egui::ComboBox::from_id_salt("taste-model").selected_text(current).show_ui(ui, |ui| {
+				for m in self.models.clone() {
+					if ui.selectable_label(self.settings.taste.model == m, &m).clicked() {
+						self.settings.taste.model = m;
+						self.save_settings();
+					}
+				}
+			});
+			if ui.button("List models").on_hover_text("Ask the endpoint what it has").clicked() {
+				let t = &self.settings.taste;
+				self.chat_note = Some("Asking…".into());
+				self.worker.models(t.endpoint.clone(), t.api_key.clone());
+			}
+			ui.separator();
+			if ui.button("Picks").on_hover_text("Searches built from your own tags, no model involved").clicked() {
+				self.refresh_picks();
+				actions.push(Action::TasteTab(false));
+			}
+			if ui.button("New brief").clicked() {
+				self.write_brief();
+			}
+		});
+		if let Some(n) = &self.chat_note {
+			ui.label(RichText::new(n).weak());
+		}
+		if !self.taste_brief.is_empty() {
+			ui.group(|ui| ui.label(RichText::new(&self.taste_brief).italics()));
+		}
+		let room = ui.available_height() - 34.0;
+		egui::ScrollArea::vertical().max_height(room.max(80.0)).stick_to_bottom(true).show(ui, |ui| {
+			if self.chat.is_empty() {
+				ui.label(RichText::new("Say what you're after — \"something with wolves at night\", \"less comic, more solo\" — and it will point a search at it.").weak());
+			}
+			for (mine, line) in &self.chat {
+				ui.horizontal(|ui| {
+					ui.label(RichText::new(if *mine { "you" } else { "guide" }).weak().small());
+					ui.label(line);
+				});
+			}
+		});
+		ui.horizontal(|ui| {
+			let send = ui.add(egui::TextEdit::singleline(&mut self.chat_input).hint_text("tell it what you want").desired_width(ui.available_width() - 60.0));
+			let enter = send.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+			if ui.button("Send").clicked() || enter {
+				self.send_chat();
+				send.request_focus();
+			}
+		});
+	}
+
+	/// Opens the save dialog for a post, suggesting a name and folder.
+	fn save_post(&mut self, i: usize) {
+		let Some(post) = self.posts.get(i) else { return };
 		let dir = dirs::download_dir()
 			.or_else(dirs::picture_dir)
 			.unwrap_or_else(settings::data_dir)
 			.join("BetterSearch");
-		if let Err(e) = std::fs::create_dir_all(&dir) {
+		self.save_dialog = Some(SaveDialog {
+			i,
+			dir,
+			name: format!("{}_{}.{}", post.site, post.id, post.ext),
+			error: None,
+		});
+	}
+
+	/// Writes the chosen file where the dialog says.
+	fn save_now(&mut self) {
+		let Some(d) = self.save_dialog.take() else { return };
+		let Some(post) = self.posts.get(d.i).cloned() else { return };
+		let Some(site) = self.site_by_id(&post.site) else {
+			self.file_note = Some(format!("{} isn't loaded", post.site));
+			return;
+		};
+		if let Err(e) = std::fs::create_dir_all(&d.dir) {
 			self.file_note = Some(e.to_string());
 			return;
 		}
-		self.worker.save(site, post, dir);
+		let name = if d.name.trim().is_empty() { format!("{}_{}.{}", post.site, post.id, post.ext) } else { d.name.trim().to_string() };
+		self.file_note = Some(format!("Saving {}…", name));
+		self.worker.save(site, post, d.dir.join(name));
 	}
 
 	/// Runs the kind of searches the profile points at, together.
@@ -614,6 +734,25 @@ impl App {
 						});
 					}
 				}
+				Msg::Models(got) => match got {
+					Ok(list) => {
+						self.models = list;
+						self.chat_note = None;
+					}
+					Err(e) => self.chat_note = Some(e),
+				},
+				Msg::Chat(got) => match got {
+					Ok(text) => {
+						self.chat.push((false, text.clone()));
+						// A last line `SEARCH: …` is a search to run.
+						if let Some(q) = text.lines().rev().find_map(|l| l.trim().strip_prefix("SEARCH:")) {
+							self.query = q.trim().trim_matches('`').to_string();
+							self.search();
+							self.taste_tab = false;
+						}
+					}
+					Err(e) => self.chat.push((false, format!("({e})"))),
+				},
 				Msg::Brief(got) => {
 					match got {
 						Ok(text) => {
@@ -942,6 +1081,7 @@ impl App {
 					}
 				}
 				Action::Save(i) => self.save_post(i),
+				Action::TasteTab(on) => self.taste_tab = on,
 				Action::VoteTag(..)
 				| Action::AddLink
 				| Action::RemoveLink(_)
@@ -1054,10 +1194,15 @@ impl App {
 				if ui.button("♥").on_hover_text("Your favorites (kept on this computer)").clicked() {
 					actions.push(Action::ShowFavorites);
 				}
-				if self.settings.taste.enabled
-					&& ui.button("✨").on_hover_text("Picks from what you like (Settings → Taste)").clicked()
-				{
-					self.refresh_picks();
+				if self.settings.taste.enabled {
+					let on = self.taste_tab;
+					if ui.selectable_label(on, "Taste").on_hover_text("Chat with a guide, and picks from what you like").clicked() {
+						actions.push(Action::TasteTab(!on));
+						if !on && self.models.is_empty() {
+							let t = &self.settings.taste;
+							self.worker.models(t.endpoint.clone(), t.api_key.clone());
+						}
+					}
 				}
 				if ui.add_enabled(!self.query.trim().is_empty(), egui::Button::new("☆ Save")).on_hover_text("Save this search").clicked() {
 					actions.push(Action::OpenSave);
@@ -1346,11 +1491,6 @@ impl App {
 				{
 					actions.push(Action::View(i));
 				}
-				if ui.button("Save").on_hover_text("The full file, not the thumbnail").clicked()
-					&& let Some(i) = self.selected
-				{
-					actions.push(Action::Save(i));
-				}
 				if ui.button("Open page").clicked() {
 					actions.push(Action::Open(post.page_url.clone()));
 				}
@@ -1360,7 +1500,7 @@ impl App {
 					actions.push(Action::Open(f.clone()));
 				}
 			});
-			ui.group(|ui| {
+			let info = ui.group(|ui| {
 				ui.horizontal(|ui| {
 					ui.label(RichText::new("Site").weak());
 					ui.strong(&post.site);
@@ -1405,6 +1545,21 @@ impl App {
 				ui.horizontal(|ui| {
 					ui.label(RichText::new(format!("{}·{}·{} · {}", post.width, post.height, post.rating.label(), post.created_at)).weak().small());
 				});
+			});
+			info.response.context_menu(|ui| {
+				if ui.button("Save file…").clicked()
+					&& let Some(i) = self.selected
+				{
+					actions.push(Action::Save(i));
+				}
+				if ui.button("Open page").clicked() {
+					actions.push(Action::Open(post.page_url.clone()));
+				}
+				if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked()
+					&& let Some(i) = self.selected
+				{
+					actions.push(Action::ToggleFavorite(i));
+				}
 			});
 			if let Some(note) = &self.file_note {
 				ui.label(RichText::new(note).weak().small());
@@ -1560,9 +1715,6 @@ impl App {
 				let fav = self.favorites.contains(&post.key());
 				if ui.button(RichText::new(if fav { "♥" } else { "♡" }).color(Color32::from_rgb(230, 90, 120))).on_hover_text("Favorite (F)").clicked() {
 					actions.push(Action::ToggleFavorite(i));
-				}
-				if ui.button("Save").on_hover_text("The full file, not the sample").clicked() {
-					actions.push(Action::Save(i));
 				}
 				if ui.button("Open page").clicked() {
 					actions.push(Action::Open(post.page_url.clone()));
@@ -1783,6 +1935,60 @@ impl App {
 		self.save_open &= open;
 	}
 
+	fn save_as_window(&mut self, ctx: &egui::Context) {
+		let Some(d) = self.save_dialog.as_mut() else { return };
+		let mut save = false;
+		let mut cancel = false;
+		egui::Window::new("Save file").collapsible(false).resizable(true).default_width(560.0).show(ctx, |ui| {
+			ui.label(RichText::new(d.dir.display().to_string()).monospace().small());
+			ui.horizontal(|ui| {
+				if ui.button("Up").clicked()
+					&& let Some(parent) = d.dir.parent()
+				{
+					d.dir = parent.to_path_buf();
+				}
+				if ui.button("Downloads").clicked() {
+					d.dir = dirs::download_dir().unwrap_or_else(settings::data_dir).join("BetterSearch");
+				}
+				if ui.button("Pictures").clicked() {
+					d.dir = dirs::picture_dir().unwrap_or_else(settings::data_dir).join("BetterSearch");
+				}
+			});
+			ui.horizontal(|ui| {
+				ui.label("Name");
+				ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(f32::INFINITY));
+			});
+			egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+				let mut dirs: Vec<_> = std::fs::read_dir(&d.dir)
+					.into_iter()
+					.flatten()
+					.flatten()
+					.filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+					.map(|e| e.file_name().to_string_lossy().into_owned())
+					.collect();
+				dirs.sort();
+				dirs.truncate(300);
+				for name in dirs {
+					if ui.selectable_label(false, format!("{name}/")).clicked() {
+						d.dir = d.dir.join(&name);
+					}
+				}
+			});
+			ui.horizontal(|ui| {
+				save = ui.button("Save").clicked();
+				cancel = ui.button("Cancel").clicked();
+			});
+			if let Some(e) = &d.error {
+				ui.colored_label(Color32::from_rgb(220, 90, 90), e);
+			}
+		});
+		if save {
+			self.save_now();
+		} else if cancel {
+			self.save_dialog = None;
+		}
+	}
+
 	fn settings_window(&mut self, ctx: &egui::Context) {
 		let mut open = self.settings_open;
 		let mut changed = false;
@@ -1830,6 +2036,16 @@ impl App {
 			ui.horizontal(|ui| {
 				ui.label("API key ");
 				changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.e6ai_key).password(true)).changed();
+			});
+			ui.add_space(8.0);
+			ui.label("Optional TBIB login (it hides file addresses from logged-out callers):");
+			ui.horizontal(|ui| {
+				ui.label("Username");
+				changed |= ui.text_edit_singleline(&mut self.settings.tbib_user).changed();
+			});
+			ui.horizontal(|ui| {
+				ui.label("API key ");
+				changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.tbib_key).password(true)).changed();
 			});
 			ui.add_space(8.0);
 			ui.separator();
@@ -2341,9 +2557,10 @@ impl App {
 		if self.selected.is_some() {
 			egui::Panel::right("detail").resizable(true).default_size(380.0).min_size(260.0).show(ui, |ui| self.detail(ui, &mut actions));
 		}
-		egui::CentralPanel::default().show(ui, |ui| self.grid(ui, &mut actions));
+		egui::CentralPanel::default().show(ui, |ui| if self.taste_tab { self.taste_view(ui, &mut actions) } else { self.grid(ui, &mut actions) });
 		}
 		self.settings_window(&ctx);
+		self.save_as_window(&ctx);
 		self.urgent |= self.translations.show(&ctx, &self.store, &self.sites);
 		self.save_window(&ctx);
 		if self.groups.show(&ctx, &self.store) {

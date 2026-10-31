@@ -37,8 +37,10 @@ and which family to pick, without changing anything.
 
 ## Taste
 
-Off by default. When on, ✨ searches for more of what you favorite, and a brief
-describes the taste in the panel's words.
+Off by default. When on, a **Taste** tab opens: chat with a guide that knows
+your tags and can answer with a search to run, ask it for picks, or have it
+write a brief in your settings. The model list is fetched from the endpoint, so
+nothing has to be typed from memory.
 
 **What leaves the machine, and that's all:** the top 40 weighted tags, and the
 ratings you have ticked if "send the ratings I tick" is left on. No pictures,

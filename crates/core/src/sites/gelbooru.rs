@@ -223,18 +223,26 @@ impl Gelbooru {
 		if !tags.is_empty() {
 			categories.insert("general".to_string(), tags.clone());
 		}
-		let file_url = non_empty(p.file_url);
+		let has_sample = match &p.sample {
+			Some(serde_json::Value::Bool(b)) => *b,
+			Some(serde_json::Value::Number(n)) => n.as_i64() != Some(0),
+			_ => true,
+		};
+		// Some of these sites send no addresses unless logged in, but the folder
+		// and file name are always there; the paths are fixed.
+		let built = p.directory.zip(p.image.clone()).filter(|(d, i)| *d > 0 && !i.is_empty());
+		let file_url = non_empty(p.file_url).or_else(|| built.as_ref().map(|(d, i)| format!("{}/images/{d}/{i}", self.base)));
+		let preview_url = non_empty(p.preview_url)
+			.or_else(|| built.as_ref().map(|(d, i)| format!("{}/thumbnails/{d}/thumbnail_{i}", self.base)));
+		let sample_url = non_empty(p.sample_url)
+			.filter(|_| has_sample)
+			.or_else(|| built.as_ref().filter(|_| has_sample).map(|(d, i)| format!("{}/samples/{d}/sample_{i}", self.base)));
 		let ext = file_url
 			.as_deref()
 			.or(p.image.as_deref())
 			.and_then(|u| u.rsplit_once('.'))
 			.map(|(_, e)| e.to_lowercase())
 			.unwrap_or_default();
-		let has_sample = match &p.sample {
-			Some(serde_json::Value::Bool(b)) => *b,
-			Some(serde_json::Value::Number(n)) => n.as_i64() != Some(0),
-			_ => true,
-		};
 		Post {
 			site: self.id.clone(),
 			id: p.id,
@@ -248,8 +256,8 @@ impl Gelbooru {
 			ext,
 			md5: non_empty(p.md5).or(non_empty(p.hash)),
 			file_url,
-			sample_url: non_empty(p.sample_url).filter(|_| has_sample),
-			preview_url: non_empty(p.preview_url),
+			sample_url,
+			preview_url,
 			page_url: format!("{}/index.php?page=post&s=view&id={}", self.base, p.id),
 			sources: non_empty(p.source).into_iter().collect(),
 			created_at: p.created_at.unwrap_or_default(),
@@ -295,6 +303,7 @@ struct RawPost {
 	/// Safebooru's name for md5.
 	hash: Option<String>,
 	image: Option<String>,
+	directory: Option<u64>,
 	file_url: Option<String>,
 	sample_url: Option<String>,
 	/// `true`/`false` on Safebooru, `1`/`0` on gelbooru.com.

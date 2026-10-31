@@ -18,6 +18,9 @@ pub struct Settings {
 	/// Optional e6ai login; it's an e621 fork with its own accounts.
 	pub e6ai_user: String,
 	pub e6ai_key: String,
+	/// Optional TBIB login; it hides file addresses from logged-out callers.
+	pub tbib_user: String,
+	pub tbib_key: String,
 	/// Danbooru login: account name and an API key from its profile page.
 	/// Raises the 2-tag search limit for Gold accounts and up.
 	pub danbooru_user: String,
@@ -163,6 +166,8 @@ impl Default for Settings {
 			e621_key: String::new(),
 			e6ai_user: String::new(),
 			e6ai_key: String::new(),
+			tbib_user: String::new(),
+			tbib_key: String::new(),
 			danbooru_user: String::new(),
 			danbooru_key: String::new(),
 			gelbooru_user: String::new(),
@@ -202,7 +207,7 @@ pub fn make_sites(s: &Settings) -> Vec<Arc<dyn Site>> {
 	push(Gelbooru::safebooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Gelbooru::gelbooru(&anon).ok().map(|x| Arc::new(x.with_login(&s.gelbooru_user, &s.gelbooru_key)) as Arc<dyn Site>));
 	push(Gelbooru::xbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Gelbooru::tbib(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::tbib(&anon).ok().map(|x| Arc::new(x.with_login(&s.tbib_user, &s.tbib_key)) as Arc<dyn Site>));
 	push(Gelbooru::hypnohub(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Realbooru::new(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Moebooru::yande_re(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
