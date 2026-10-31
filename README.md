@@ -34,6 +34,22 @@ can be removed again. Logins are optional and only for sites that need one.
 `tools/probe-site.sh <host>` says in a few seconds whether a site is addable
 and which family to pick, without changing anything.
 
+## Local API
+
+Off by default. ⚙ Settings → Local API lets a program on this computer search
+and fetch pictures with a bearer token: `/api/v1/health`, `/openapi.json`,
+`/search`, `/post/{site}/{id}`, `/file`, `/thumb`, `/taste`, and — only with
+read-only switched off — `/favorite` and `/feedback`. It listens on loopback
+unless "also from the local network" is ticked, is rate-limited, and logs paths
+and statuses but not query strings.
+
+The port and token go in `api.json` beside the vault (mode 0600) so a caller can
+find them; nothing else is in it, and it's removed when the API is off. The
+token can be replaced in Settings at any time.
+
+`/file` exists because booru CDNs hotlink-protect and key-gate their URLs: the
+app has the session and the keys, so the caller doesn't need either.
+
 Rule34.xxx, furry.booru.org and safebooru.donmai.us currently
 answer an interactive challenge to plain clients, so they can't be added until
 a cookie import exists. Paheal answers HTML rather than its API.

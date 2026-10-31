@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch; a new push stops the old one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # eframe needs the X11 and GL headers even for a headless build.
+      - name: Libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libxkbcommon-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Warnings are failures: the tree is clean, and it stays that way.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release --locked

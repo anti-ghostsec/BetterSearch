@@ -2,7 +2,7 @@
 // between tags. The engine lives in bettersearch-core; this is the window.
 // Everything it keeps is in an encrypted vault, opened with a PIN (lock.rs).
 
-#[allow(dead_code)]
+mod api_server;
 mod cache;
 mod groups;
 mod lock;
@@ -16,7 +16,7 @@ mod worker;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use bettersearch_core::sites::{Danbooru, E621, Gelbooru, Moebooru, user_agent};
+
 use bettersearch_core::store::RelationState;
 use bettersearch_core::taggraph::{ItemLink, ItemTag, LinkSuggestion};
 use bettersearch_core::{Post, Rating, Site, Store, TagSuggestion};
@@ -157,6 +157,9 @@ struct App {
 	groups: Groups,
 	sites: Vec<Arc<dyn Site>>,
 	site_form: SiteForm,
+	server: Option<api_server::Server>,
+	api_note: Option<String>,
+	api_started: bool,
 	store: Arc<Mutex<Store>>,
 	worker: Worker,
 	query: String,
@@ -219,49 +222,6 @@ struct App {
 	ctx: egui::Context,
 }
 
-fn make_sites(s: &Settings) -> Vec<Arc<dyn Site>> {
-	// Your name goes only to e621/e926, which ask for it; other sites get the plain app name.
-	let ua = user_agent(&s.contact);
-	let anon = user_agent("");
-	let mut out: Vec<Arc<dyn Site>> = Vec::new();
-	// With an API key but no login name, the name at the top of Settings is the e621 username.
-	let e621_user = if s.e621_user.trim().is_empty() { &s.contact } else { &s.e621_user };
-	let mut push = |site: Option<Arc<dyn Site>>| {
-		if let Some(site) = site {
-			out.push(site);
-		}
-	};
-	push(E621::e926(&ua).ok().map(|x| Arc::new(x.with_login(e621_user, &s.e621_key)) as Arc<dyn Site>));
-	push(E621::e621(&ua).ok().map(|x| Arc::new(x.with_login(e621_user, &s.e621_key)) as Arc<dyn Site>));
-	push(E621::e6ai(&ua).ok().map(|x| Arc::new(x.with_login(&s.e6ai_user, &s.e6ai_key)) as Arc<dyn Site>));
-	push(Danbooru::danbooru(&anon).ok().map(|x| Arc::new(x.with_login(&s.danbooru_user, &s.danbooru_key)) as Arc<dyn Site>));
-	push(Danbooru::new("aibooru", "aibooru (AI art)", "https://aibooru.online", &anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Gelbooru::safebooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Gelbooru::gelbooru(&anon).ok().map(|x| Arc::new(x.with_login(&s.gelbooru_user, &s.gelbooru_key)) as Arc<dyn Site>));
-	push(Gelbooru::xbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Gelbooru::tbib(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Gelbooru::hypnohub(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Moebooru::yande_re(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Moebooru::konachan(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Moebooru::konachan_net(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Moebooru::sakugabooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	for c in &s.custom_sites {
-		let site: Option<Arc<dyn Site>> = match c.family {
-			Family::Gelbooru => Gelbooru::custom(&c.id, &c.name, &c.base, &anon)
-				.ok()
-				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
-			Family::Danbooru => Danbooru::new(&c.id, &c.name, &c.base, &anon)
-				.ok()
-				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
-			Family::E621 => E621::new(&c.id, &c.name, &c.base, &anon)
-				.ok()
-				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
-			Family::Moebooru => Moebooru::new(&c.id, &c.name, &c.base, &anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>),
-		};
-		push(site);
-	}
-	out
-}
 
 /// The word being typed at the end of the search, without `-`, `~`, `(` or `kind[`.
 fn typing_word(query: &str) -> Option<(usize, &str)> {
@@ -288,8 +248,11 @@ impl App {
 		let favorites = store.lock().unwrap().favorite_keys().unwrap_or_default();
 		let worker = Worker::spawn(ctx.clone(), store.clone());
 		App {
-			sites: make_sites(&settings),
+			sites: settings::make_sites(&settings),
 			site_form: SiteForm::default(),
+			server: None,
+			api_note: None,
+			api_started: false,
 			query: settings.last_search.clone(),
 			settings,
 			settings_open: false,
@@ -348,8 +311,27 @@ impl App {
 		self.urgent = true;
 	}
 
+	/// Starts, restarts or stops the local API to match the settings.
+	fn sync_api(&mut self) {
+		self.server = None;
+		if !self.settings.api.enabled {
+			return;
+		}
+		if self.settings.api.token.trim().is_empty() {
+			self.settings.api.token = api_server::new_token();
+		}
+		match api_server::Server::start(&self.settings.api, self.store.clone()) {
+			Ok(server) => {
+				self.api_note = None;
+				self.server = Some(server);
+			}
+			Err(e) => self.api_note = Some(e.to_string()),
+		}
+	}
+
 	/// Writes the vault one last time; called on lock and exit.
 	fn shutdown(&mut self) {
+		self.server = None;
 		self.save_settings();
 		self.saver.flush(&self.store);
 	}
@@ -1626,7 +1608,7 @@ impl App {
 			if let Some(id) = remove {
 				self.settings.custom_sites.retain(|c| c.id != id);
 				self.settings.sites.retain(|s| s != &id);
-				self.sites = make_sites(&self.settings);
+				self.sites = settings::make_sites(&self.settings);
 				self.save_settings();
 			}
 			if ui.button("Add a booru…").clicked() {
@@ -1682,7 +1664,7 @@ impl App {
 								let id = c.id.clone();
 								self.settings.custom_sites.push(c);
 								self.settings.sites.push(id);
-								self.sites = make_sites(&self.settings);
+								self.sites = settings::make_sites(&self.settings);
 								self.save_settings();
 								self.site_form = SiteForm::default();
 							}
@@ -1714,6 +1696,90 @@ impl App {
 				.checkbox(&mut self.settings.show_imageless, "Show posts the site sent without images")
 				.on_hover_text("e621 leaves the images out for logged-out users on posts with tags from its default blacklist. Logging in above shows them.")
 				.changed();
+			ui.add_space(8.0);
+			ui.separator();
+			ui.strong("Local API");
+			ui.label(
+				RichText::new("A program on this computer can search and fetch pictures with a token. Nothing else is exposed.")
+					.weak(),
+			);
+			let mut api_on = self.settings.api.enabled;
+			if ui.checkbox(&mut api_on, "Answer other programs").changed() {
+				self.settings.api.enabled = api_on;
+				self.save_settings();
+				self.sync_api();
+			}
+			if self.settings.api.enabled {
+				ui.horizontal(|ui| {
+					ui.label("Port (0 picks a free one)");
+					let mut port = self.settings.api.port;
+					if ui.add(egui::DragValue::new(&mut port).range(1024..=65535)).changed() {
+						self.settings.api.port = port;
+						self.save_settings();
+						self.sync_api();
+					}
+				});
+				ui.horizontal(|ui| {
+					ui.label("Token");
+					ui.add(egui::Label::new(RichText::new(&self.settings.api.token).monospace()).truncate());
+					if ui.small_button("Copy").clicked() {
+						ui.ctx().copy_text(self.settings.api.token.clone());
+					}
+					if ui.small_button("New").clicked() {
+						self.settings.api.token = api_server::new_token();
+						self.save_settings();
+						self.sync_api();
+					}
+				});
+				let mut lan = self.settings.api.lan;
+				if ui.checkbox(&mut lan, "Also from the local network").changed() {
+					self.settings.api.lan = lan;
+					self.save_settings();
+					self.sync_api();
+				}
+				let mut ro = self.settings.api.read_only;
+				if ui.checkbox(&mut ro, "Read-only (no favorites or feedback)").changed() {
+					self.settings.api.read_only = ro;
+					self.save_settings();
+					self.sync_api();
+				}
+				ui.horizontal(|ui| {
+					ui.label("Calls a minute");
+					let mut rate = self.settings.api.per_minute;
+					if ui.add(egui::DragValue::new(&mut rate).range(1..=600)).changed() {
+						self.settings.api.per_minute = rate;
+						self.save_settings();
+						self.sync_api();
+					}
+				});
+				let info = self.server.as_ref().map(|s| (s.port(), s.busy(), s.log()));
+				let mut restart = false;
+				match info {
+					Some((port, busy, log)) => {
+						ui.label(
+							RichText::new(format!("Listening on {port} ({busy} calls now)"))
+								.color(Color32::from_rgb(110, 200, 120)),
+						);
+						if ui.small_button("Clear log").clicked() {
+							restart = true;
+						}
+						for (status, line, ms) in log.into_iter().take(8) {
+							ui.label(RichText::new(format!("{status} {line} {ms}ms")).weak().monospace());
+						}
+					}
+					None => {
+						if let Some(n) = &self.api_note {
+							ui.colored_label(Color32::from_rgb(230, 120, 90), format!("Not running: {n}"));
+						} else {
+							ui.label(RichText::new("Not running.").weak());
+						}
+					}
+				}
+				if restart {
+					self.sync_api();
+				}
+				ui.label(RichText::new(format!("Port and token are in {}", settings::data_dir().join("api.json").display())).weak());
+			}
 			ui.add_space(8.0);
 			ui.separator();
 			ui.strong("Privacy");
@@ -1789,7 +1855,7 @@ impl App {
 		}
 		if changed {
 			self.save_settings();
-			self.sites = make_sites(&self.settings);
+			self.sites = settings::make_sites(&self.settings);
 		}
 		self.settings_open = open;
 	}
@@ -1878,6 +1944,11 @@ fn short_count(n: u64) -> String {
 
 impl App {
 	fn ui(&mut self, ui: &mut egui::Ui) {
+		if !self.api_started {
+			self.api_started = true;
+			self.sync_api();
+		}
+
 		let ctx = ui.ctx().clone();
 		self.receive(&ctx);
 		let mut actions = Vec::new();

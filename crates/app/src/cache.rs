@@ -60,16 +60,19 @@ impl Cache {
 		}
 	}
 
+	#[allow(dead_code)]
 	pub fn clear(&mut self) {
 		self.entries.clear();
 		self.order.clear();
 		self.used = 0;
 	}
 
+	#[allow(dead_code)]
 	pub fn len(&self) -> usize {
 		self.entries.len()
 	}
 
+	#[allow(dead_code)]
 	pub fn bytes(&self) -> usize {
 		self.used
 	}

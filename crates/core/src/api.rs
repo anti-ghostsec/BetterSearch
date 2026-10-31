@@ -319,7 +319,7 @@ impl Response {
 		}
 	}
 
-	fn error(status: u16, message: &str) -> Self {
+	pub fn error(status: u16, message: &str) -> Self {
 		Self::json(status, json!({ "error": message }))
 	}
 

@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
+use bettersearch_core::sites::{Danbooru, E621, Gelbooru, Moebooru, Site, user_agent};
 use bettersearch_core::{Rating, Store};
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +177,50 @@ impl Default for Settings {
 			custom_sites: Vec::new(),
 		}
 	}
+}
+
+pub fn make_sites(s: &Settings) -> Vec<Arc<dyn Site>> {
+	// Your name goes only to e621/e926, which ask for it; other sites get the plain app name.
+	let ua = user_agent(&s.contact);
+	let anon = user_agent("");
+	let mut out: Vec<Arc<dyn Site>> = Vec::new();
+	// With an API key but no login name, the name at the top of Settings is the e621 username.
+	let e621_user = if s.e621_user.trim().is_empty() { &s.contact } else { &s.e621_user };
+	let mut push = |site: Option<Arc<dyn Site>>| {
+		if let Some(site) = site {
+			out.push(site);
+		}
+	};
+	push(E621::e926(&ua).ok().map(|x| Arc::new(x.with_login(e621_user, &s.e621_key)) as Arc<dyn Site>));
+	push(E621::e621(&ua).ok().map(|x| Arc::new(x.with_login(e621_user, &s.e621_key)) as Arc<dyn Site>));
+	push(E621::e6ai(&ua).ok().map(|x| Arc::new(x.with_login(&s.e6ai_user, &s.e6ai_key)) as Arc<dyn Site>));
+	push(Danbooru::danbooru(&anon).ok().map(|x| Arc::new(x.with_login(&s.danbooru_user, &s.danbooru_key)) as Arc<dyn Site>));
+	push(Danbooru::new("aibooru", "aibooru (AI art)", "https://aibooru.online", &anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::safebooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::gelbooru(&anon).ok().map(|x| Arc::new(x.with_login(&s.gelbooru_user, &s.gelbooru_key)) as Arc<dyn Site>));
+	push(Gelbooru::xbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::tbib(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::hypnohub(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::yande_re(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::konachan(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::konachan_net(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::sakugabooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	for c in &s.custom_sites {
+		let site: Option<Arc<dyn Site>> = match c.family {
+			Family::Gelbooru => Gelbooru::custom(&c.id, &c.name, &c.base, &anon)
+				.ok()
+				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
+			Family::Danbooru => Danbooru::new(&c.id, &c.name, &c.base, &anon)
+				.ok()
+				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
+			Family::E621 => E621::new(&c.id, &c.name, &c.base, &anon)
+				.ok()
+				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
+			Family::Moebooru => Moebooru::new(&c.id, &c.name, &c.base, &anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>),
+		};
+		push(site);
+	}
+	out
 }
 
 pub fn data_dir() -> PathBuf {
