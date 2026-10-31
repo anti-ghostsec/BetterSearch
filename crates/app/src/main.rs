@@ -744,7 +744,9 @@ impl App {
 			self.viewer_actual = !self.viewer_actual;
 		}
 		if self.viewer.is_some() && self.playing.is_some() {
-			if pressed(Key::Space) {
+			// A focused button already answers Space itself; taking it too would
+			// toggle twice (there are two players now, viewer and panel).
+			if pressed(Key::Space) && self.ctx.memory(|m| m.focused().is_none()) {
 				actions.push(Action::TogglePlay);
 			}
 			if pressed(Key::M) {
