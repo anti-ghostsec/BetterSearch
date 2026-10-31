@@ -33,6 +33,77 @@ pub struct Settings {
 	/// Show posts the site sent without any image (e621 does that for logged-out
 	/// users on posts with tags from its default blacklist).
 	pub show_imageless: bool,
+	/// The Taste tab and the model behind it. Off until switched on.
+	pub taste: Taste,
+	/// The local API other programs can search through. Off until switched on.
+	pub api: Api,
+}
+
+/// Where the model calls go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+	/// No model: the tab still works, from tag weights alone.
+	None,
+	Venice,
+	OpenAiCompatible,
+	Anthropic,
+	Local,
+}
+
+/// Taste settings. The tab is hidden unless `enabled`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Taste {
+	pub enabled: bool,
+	pub provider: Provider,
+	pub endpoint: String,
+	pub api_key: String,
+	pub model: String,
+	/// A dial set by hand instead of measured from the favorites.
+	pub dial_override: Option<f32>,
+	/// Share of results that should be a stretch, 0 to 1.
+	pub exploration: f32,
+	/// Whether the README-able rating mix may go to the model.
+	pub send_ratings: bool,
+	pub max_calls_per_hour: u32,
+}
+
+/// The local API's settings. Off until `enabled`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Api {
+	pub enabled: bool,
+	/// 0 picks a free port.
+	pub port: u16,
+	/// Reachable from the local network instead of only this computer.
+	pub lan: bool,
+	pub token: String,
+	/// Read-only until switched off: no favorites, feedback or dial changes.
+	pub read_only: bool,
+	pub per_minute: u32,
+	/// Origins allowed to call it from a browser page.
+	pub cors: Vec<String>,
+}
+
+impl Default for Taste {
+	fn default() -> Self {
+		Self {
+			enabled: false,
+			provider: Provider::None,
+			endpoint: String::new(),
+			api_key: String::new(),
+			model: String::new(),
+			dial_override: None,
+			exploration: 0.2,
+			send_ratings: true,
+			max_calls_per_hour: 60,
+		}
+	}
+}
+
+impl Default for Api {
+	fn default() -> Self {
+		Self { enabled: false, port: 0, lan: false, token: String::new(), read_only: true, per_minute: 30, cors: Vec::new() }
+	}
 }
 
 impl Default for Settings {
@@ -52,6 +123,8 @@ impl Default for Settings {
 			auto_links: true,
 			show_tags: true,
 			show_imageless: false,
+			taste: Taste::default(),
+			api: Api::default(),
 		}
 	}
 }
@@ -97,5 +170,15 @@ mod tests {
 		assert_eq!(Settings::from_json(r#"{"site":"e621"}"#).sites, vec!["e621"]);
 		assert_eq!(Settings::from_json(r#"{"sites":["e926","danbooru"]}"#).sites, vec!["e926", "danbooru"]);
 		assert_eq!(Settings::from_json("{}").sites, vec!["e926"]);
+	}
+
+	#[test]
+	fn taste_and_api_are_off_until_switched_on() {
+		let s = Settings::from_json("{}");
+		assert!(!s.taste.enabled);
+		assert!(!s.api.enabled);
+		assert_eq!(s.taste.provider, super::Provider::None);
+		assert!(s.api.read_only);
+		assert_eq!(s.taste.exploration, 0.2);
 	}
 }

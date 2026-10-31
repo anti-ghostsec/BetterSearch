@@ -150,6 +150,11 @@ impl Store {
 		TagGraph::new(&self.conn, &self.opts)
 	}
 
+	/// The raw connection, for queries that don't need the graph.
+	pub fn conn_ref(&self) -> &Connection {
+		&self.conn
+	}
+
 	pub fn save_posts(&self, posts: &[Post]) -> Result<()> {
 		let tx = self.conn.unchecked_transaction()?;
 		{
@@ -212,6 +217,20 @@ impl Store {
 			.prepare_cached("SELECT p.json FROM favorites f JOIN posts p ON p.key = f.key WHERE f.site = ? ORDER BY p.id DESC")?;
 		let rows = st.query_map([site], |r| r.get::<_, String>(0))?;
 		Ok(rows.filter_map(|r| r.ok().and_then(|j| serde_json::from_str(&j).ok())).collect())
+	}
+
+	/// Every favorite's tags with when it was favorited, for taste scoring.
+	pub fn favorite_tag_events(&self) -> Result<Vec<(String, i64)>> {
+		let mut st = self.conn.prepare_cached("SELECT p.json, f.at FROM favorites f JOIN posts p ON p.key = f.key")?;
+		let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+		let mut out = Vec::new();
+		for row in rows {
+			let (json, at) = row?;
+			if let Ok(post) = serde_json::from_str::<Post>(&json) {
+				out.extend(post.tags.into_iter().map(|t| (t, at)));
+			}
+		}
+		Ok(out)
 	}
 
 	fn graph_sql(&self, text: &str) -> String {

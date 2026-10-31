@@ -12,6 +12,7 @@ pub mod search;
 pub mod sites;
 pub mod store;
 pub mod taggraph;
+pub mod taste;
 mod wipe;
 
 pub use multi::MultiSearch;
