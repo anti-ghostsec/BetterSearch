@@ -15,10 +15,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::Rating;
+
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_QUERY_CHARS: usize = 512;
 pub const MAX_RESULTS: usize = 100;
+pub const MAX_SITES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -239,6 +242,16 @@ impl Limiter {
 	}
 }
 
+/// One search as the caller asked for it. `sites` and `ratings` are empty when
+/// it left them to the app's settings.
+#[derive(Debug, Clone)]
+pub struct SearchReq {
+	pub text: String,
+	pub sites: Vec<String>,
+	pub ratings: Vec<Rating>,
+	pub limit: usize,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Summary {
 	pub site: String,
@@ -270,7 +283,7 @@ pub struct TasteView {
 
 /// What the app does for the API.
 pub trait Backend: Send + Sync {
-	fn search(&self, query: &str, limit: usize) -> Result<Vec<Summary>, String>;
+	fn search(&self, req: &SearchReq) -> Result<Vec<Summary>, String>;
 	fn post(&self, site: &str, id: u64) -> Result<Option<Summary>, String>;
 	fn file(&self, site: &str, id: u64, thumb: bool) -> Result<Option<File>, String>;
 	fn taste(&self) -> Result<Option<TasteView>, String>;
@@ -389,8 +402,36 @@ pub fn handle(req: &Request, cx: &Context<'_>) -> Response {
 				return Response::error(413, "q is too long");
 			}
 			let limit = req.number("limit", 40, 1, MAX_RESULTS);
-			match cx.backend.search(q, limit) {
-				Ok(posts) => Response::json(200, json!({ "query": q, "limit": limit, "posts": posts })),
+			let sites: Vec<String> = req
+				.param("sites")
+				.unwrap_or_default()
+				.split(',')
+				.map(|s| s.trim().to_lowercase())
+				.filter(|s| !s.is_empty())
+				.take(MAX_SITES)
+				.collect();
+			let ratings = match req.param("ratings").unwrap_or_default() {
+				"" => Vec::new(),
+				list => {
+					let mut out = Vec::new();
+					for c in list.chars().filter(|c| *c != ',') {
+						match Rating::from_name(&c.to_string()) {
+							Some(r) => out.push(r),
+							None => return Response::error(400, &format!("unknown rating {c:?}: use s, q, e")),
+						}
+					}
+					out
+				}
+			};
+			let asked = SearchReq { text: q.to_string(), sites, ratings, limit };
+			match cx.backend.search(&asked) {
+				Ok(posts) => Response::json(200, json!({
+					"query": q,
+					"sites": asked.sites,
+					"ratings": asked.ratings.iter().map(|r| r.letter().to_string()).collect::<Vec<_>>(),
+					"limit": limit,
+					"posts": posts,
+				})),
 				Err(e) => Response::error(400, &e),
 			}
 		}
@@ -458,7 +499,9 @@ pub fn openapi() -> Value {
 					"summary": "Run a search in the app's query language",
 					"parameters": [
 						{ "name": "q", "in": "query", "required": true, "schema": { "type": "string", "maxLength": MAX_QUERY_CHARS } },
-						{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": MAX_RESULTS, "default": 40 } }
+						{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": MAX_RESULTS, "default": 40 } },
+						{ "name": "sites", "in": "query", "description": "Comma-separated site ids; the app's current set if left out", "schema": { "type": "string" } },
+						{ "name": "ratings", "in": "query", "description": "s, q and/or e; the app's ticked ratings if left out", "schema": { "type": "string" } }
 					],
 					"responses": { "200": { "description": "Matches" } }
 				}
@@ -567,12 +610,12 @@ mod tests {
 
 	struct Fake;
 	impl Backend for Fake {
-		fn search(&self, q: &str, _: usize) -> Result<Vec<Summary>, String> {
+		fn search(&self, req: &SearchReq) -> Result<Vec<Summary>, String> {
 			Ok(vec![Summary {
 				site: "e926".into(),
 				id: 1,
 				rating: "s".into(),
-				tags: vec![q.into()],
+				tags: vec![req.text.clone()],
 				width: 1,
 				height: 1,
 				page_url: String::new(),
@@ -614,6 +657,18 @@ mod tests {
 		assert_eq!(handle(&get("/api/v1/search?q=fox", ""), &cx(&l, true, &b)).status, 401);
 		assert_eq!(handle(&get("/api/v1/search?q=fox", "Bearer wrong"), &cx(&l, true, &b)).status, 401);
 		assert_eq!(handle(&get("/api/v1/search?q=fox", "Bearer secret"), &cx(&l, true, &b)).status, 200);
+	}
+
+	#[test]
+	fn search_overrides_are_echoed_and_checked() {
+		let (l, b) = (Limiter::new(10), Fake);
+		let r = handle(&get("/api/v1/search?q=fox&sites=e926,e621&ratings=s,q", "Bearer secret"), &cx(&l, true, &b));
+		assert_eq!(r.status, 200);
+		let body: Value = serde_json::from_slice(&r.body).unwrap();
+		assert_eq!(body["sites"], json!(["e926", "e621"]));
+		assert_eq!(body["ratings"], json!(["s", "q"]));
+		let r = handle(&get("/api/v1/search?q=fox&ratings=s,x", "Bearer secret"), &cx(&l, true, &b));
+		assert_eq!(r.status, 400);
 	}
 
 	#[test]
