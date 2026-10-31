@@ -2,6 +2,9 @@
 name = "bettersearch"
 version = "0.1.0"
 edition = "2024"
+description = "A desktop booru search with real boolean searches, tags and local learning"
+repository = "https://github.com/anti-ghostsec/BetterSearch"
+license = "MIT"
 
 [dependencies]
 bettersearch-core = { version = "0.1.0", path = "../core" }

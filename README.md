@@ -386,3 +386,7 @@ autocomplete, image fetch) and say what its search box can take in
 - Moebooru (Konachan, yande.re), more Danbooru and Gelbooru 0.2 sites
 - blacklists with conditions
 - thumbnails cached on disk (encrypted, like everything else)
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).
