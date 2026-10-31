@@ -166,6 +166,11 @@ pub struct Server {
 impl Server {
 	/// Binds and starts serving. `enabled` addresses are the caller's problem.
 	pub fn start(api_settings: &settings::Api, store: Arc<Mutex<Store>>) -> std::io::Result<Server> {
+		Self::start_in(api_settings, store, settings::data_dir())
+	}
+
+	/// `start`, with the discovery file put somewhere else (tests).
+	pub fn start_in(api_settings: &settings::Api, store: Arc<Mutex<Store>>, dir: std::path::PathBuf) -> std::io::Result<Server> {
 		let host = if api_settings.lan { "0.0.0.0" } else { "127.0.0.1" };
 		let listener = TcpListener::bind((host, api_settings.port))?;
 		listener.set_nonblocking(false)?;
@@ -178,7 +183,7 @@ impl Server {
 		let limiter = Arc::new(Limiter::new(api_settings.per_minute));
 		let token = if api_settings.token.trim().is_empty() { new_token() } else { api_settings.token.clone() };
 
-		let discovery = write_discovery(addr.port(), &token).ok();
+		let discovery = write_discovery(&dir, addr.port(), &token).ok();
 
 		let worker = {
 			let (stop, live, log, backend) = (stop.clone(), live.clone(), log.clone(), backend.clone());
@@ -298,8 +303,9 @@ pub fn new_token() -> String {
 
 /// Tells another program where to call and with what. Mode 0600, nothing but
 /// the port and token, removed when the server stops.
-fn write_discovery(port: u16, token: &str) -> std::io::Result<std::path::PathBuf> {
-	let path = settings::data_dir().join("api.json");
+fn write_discovery(dir: &std::path::Path, port: u16, token: &str) -> std::io::Result<std::path::PathBuf> {
+	std::fs::create_dir_all(dir)?;
+	let path = dir.join("api.json");
 	let mut opts = std::fs::OpenOptions::new();
 	opts.write(true).create(true).truncate(true);
 	use std::os::unix::fs::OpenOptionsExt as _;
@@ -323,15 +329,21 @@ mod tests {
 		(status, raw)
 	}
 
-	fn up() -> (Server, Arc<Mutex<Store>>) {
+	/// Each test gets its own directory, so one dropping can't delete the
+	/// other's `api.json`.
+	fn up() -> (Server, Arc<Mutex<Store>>, std::path::PathBuf) {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		static N: AtomicUsize = AtomicUsize::new(0);
+		let dir = std::env::temp_dir().join(format!("bs-api-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
 		let store = Arc::new(Mutex::new(Store::in_memory().unwrap()));
 		let cfg = settings::Api { enabled: true, token: "test-token".into(), ..Default::default() };
-		(Server::start(&cfg, store.clone()).unwrap(), store)
+		let server = Server::start_in(&cfg, store.clone(), dir.clone()).unwrap();
+		(server, store, dir)
 	}
 
 	#[test]
 	fn serves_health_open_and_everything_else_closed() {
-		let (server, _store) = up();
+		let (server, _store, _dir) = up();
 		let port = server.port();
 		assert_eq!(call(port, "/api/v1/health", None).0, 200);
 		assert_eq!(call(port, "/api/v1/openapi.json", None).0, 200);
@@ -341,13 +353,14 @@ mod tests {
 
 	#[test]
 	fn announces_itself_and_cleans_up() {
-		let (server, _store) = up();
-		let path = crate::settings::data_dir().join("api.json");
+		let (server, _store, dir) = up();
+		let path = dir.join("api.json");
 		let text = std::fs::read_to_string(&path).unwrap();
 		assert!(text.contains("\"port\"") && text.contains("test-token"));
 		let port = server.port();
 		drop(server);
 		assert!(!path.exists(), "api.json outlives the server");
 		assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
