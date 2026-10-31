@@ -78,7 +78,8 @@ impl E621 {
 		let mut tries = 0;
 		let res = loop {
 			self.throttle.wait();
-			let mut req = self.client.get(format!("{}{path}", self.base)).query(query);
+			let url = format!("{}{path}", self.base);
+		let mut req = super::with_cookie(self.client.get(url), &format!("{}{path}", self.base)).query(query);
 			if let Some((u, k)) = &self.login {
 				req = req.basic_auth(u, Some(k));
 			}
@@ -302,6 +303,10 @@ impl Site for E621 {
 
 	fn name(&self) -> &str {
 		&self.name
+	}
+
+	fn base(&self) -> &str {
+		&self.base
 	}
 
 	fn caps(&self) -> Capabilities {

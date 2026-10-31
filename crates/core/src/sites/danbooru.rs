@@ -67,7 +67,8 @@ impl Danbooru {
 
 	fn get<T: for<'de> Deserialize<'de>>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
 		self.throttle.wait();
-		let mut req = self.client.get(format!("{}{path}", self.base)).query(query);
+		let url = format!("{}{path}", self.base);
+		let mut req = super::with_cookie(self.client.get(url), &format!("{}{path}", self.base)).query(query);
 		if let Some((u, k)) = &self.login {
 			req = req.basic_auth(u, Some(k));
 		}
@@ -292,6 +293,10 @@ impl Site for Danbooru {
 
 	fn name(&self) -> &str {
 		&self.name
+	}
+
+	fn base(&self) -> &str {
+		&self.base
 	}
 
 	fn caps(&self) -> Capabilities {

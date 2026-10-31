@@ -197,6 +197,9 @@ mod tests {
 		fn name(&self) -> &str {
 			self.id
 		}
+		fn base(&self) -> &str {
+			"https://example.invalid"
+		}
 		fn caps(&self) -> Capabilities {
 			Capabilities { max_tags: 10, tilde_or: true, max_wildcards: 1, metas: &["rating"], free_metas: &[], page_size: 10 }
 		}
@@ -270,6 +273,9 @@ mod tests {
 			fn name(&self) -> &str {
 				"safe"
 			}
+		fn base(&self) -> &str {
+			"https://example.invalid"
+		}
 			fn caps(&self) -> Capabilities {
 				self.0.caps()
 			}
@@ -317,6 +323,9 @@ mod tests {
 			fn name(&self) -> &str {
 				self.0.id
 			}
+		fn base(&self) -> &str {
+			"https://example.invalid"
+		}
 			fn caps(&self) -> Capabilities {
 				self.0.caps()
 			}

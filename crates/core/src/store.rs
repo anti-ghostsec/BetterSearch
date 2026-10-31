@@ -134,6 +134,11 @@ impl Store {
 				created_at INTEGER NOT NULL,
 				run_at INTEGER
 			);
+			CREATE TABLE IF NOT EXISTS cookies (
+				host TEXT PRIMARY KEY,
+				header TEXT NOT NULL,
+				at INTEGER NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS history (
 				id INTEGER PRIMARY KEY,
 				query TEXT NOT NULL,
@@ -217,6 +222,27 @@ impl Store {
 			.prepare_cached("SELECT p.json FROM favorites f JOIN posts p ON p.key = f.key WHERE f.site = ? ORDER BY p.id DESC")?;
 		let rows = st.query_map([site], |r| r.get::<_, String>(0))?;
 		Ok(rows.filter_map(|r| r.ok().and_then(|j| serde_json::from_str(&j).ok())).collect())
+	}
+
+	/// Borrowed browser cookies, by host.
+	pub fn set_cookie(&self, host: &str, header: &str) -> Result<()> {
+		self.conn.execute(
+			"INSERT INTO cookies (host, header, at) VALUES (?, ?, unixepoch())
+			ON CONFLICT (host) DO UPDATE SET header = excluded.header, at = excluded.at",
+			rusqlite::params![host, header],
+		)?;
+		Ok(())
+	}
+
+	pub fn cookies(&self) -> Result<Vec<(String, String, i64)>> {
+		let mut st = self.conn.prepare_cached("SELECT host, header, at FROM cookies")?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+		Ok(rows.collect::<rusqlite::Result<_>>()?)
+	}
+
+	pub fn delete_cookie(&self, host: &str) -> Result<()> {
+		self.conn.execute("DELETE FROM cookies WHERE host = ?", [host])?;
+		Ok(())
 	}
 
 	/// Every favorite's tags with when it was favorited, for taste scoring.

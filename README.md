@@ -50,9 +50,23 @@ token can be replaced in Settings at any time.
 `/file` exists because booru CDNs hotlink-protect and key-gate their URLs: the
 app has the session and the keys, so the caller doesn't need either.
 
-Rule34.xxx, furry.booru.org and safebooru.donmai.us currently
-answer an interactive challenge to plain clients, so they can't be added until
-a cookie import exists. Paheal answers HTML rather than its API.
+## Blocked sites
+
+Rule34.xxx, furry.booru.org, safebooru.donmai.us and every `booru.org` site
+answer an interactive challenge to plain clients.
+
+Open the site once in a browser, then hand its cookie to the app (⚙ Settings →
+Blocked sites): either **Copy cookies now**, which reads it out of a Firefox or
+LibreWolf profile, or paste the `Cookie` header yourself. The cookie is kept in
+the vault and sent to that host only, and searches work from then on until it
+expires.
+
+Wisp keeps its session in memory, so there is no file to read — paste is the
+way for it. `cf_clearance` usually lasts hours, not days.
+
+The app copies clearance cookies by itself for the sites it is about to search
+when a stored one is over ten minutes old, so a working cookie keeps working
+without you doing anything. Paheal answers HTML rather than its API.
 
 On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
 `safe`), and `sensitive` counts as *Questionable*. Danbooru's 2-tag limit

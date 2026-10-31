@@ -56,7 +56,8 @@ impl Moebooru {
 
 	fn get(&self, path: &str, query: &[(&str, String)]) -> Result<String> {
 		self.throttle.wait();
-		let res = self.client.get(format!("{}{path}", self.base)).query(query).send()?;
+		let url = format!("{}{path}", self.base);
+		let res = super::with_cookie(self.client.get(&url), &url).query(query).send()?;
 		if !res.status().is_success() {
 			return Err(Error::Api { site: self.name.clone(), message: res.status().to_string() });
 		}
@@ -166,6 +167,10 @@ impl Site for Moebooru {
 
 	fn name(&self) -> &str {
 		&self.name
+	}
+
+	fn base(&self) -> &str {
+		&self.base
 	}
 
 	fn caps(&self) -> Capabilities {

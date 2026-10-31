@@ -45,6 +45,8 @@ pub struct Settings {
 	pub api: Api,
 	/// Boorus you added yourself.
 	pub custom_sites: Vec<CustomSite>,
+	/// Reuse the browser's clearance cookies for sites that challenge the app.
+	pub browser_cookies: bool,
 }
 
 /// Which API a site speaks, so the right adapter is built for it.
@@ -136,7 +138,7 @@ impl Default for Taste {
 		Self {
 			enabled: false,
 			provider: Provider::None,
-			endpoint: String::new(),
+			endpoint: "https://api.venice.ai/api/v1".into(),
 			api_key: String::new(),
 			model: String::new(),
 			dial_override: None,
@@ -175,6 +177,7 @@ impl Default for Settings {
 			taste: Taste::default(),
 			api: Api::default(),
 			custom_sites: Vec::new(),
+			browser_cookies: true,
 		}
 	}
 }

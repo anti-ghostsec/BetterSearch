@@ -4,6 +4,7 @@
 
 mod api_server;
 mod cache;
+mod cookies;
 mod groups;
 mod lock;
 mod media;
@@ -19,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use bettersearch_core::store::RelationState;
 use bettersearch_core::taggraph::{ItemLink, ItemTag, LinkSuggestion};
-use bettersearch_core::{Post, Rating, Site, Store, TagSuggestion};
+use bettersearch_core::{Post, Rating, Site, Store, TagSuggestion, taste};
 use eframe::egui::{self, Color32, RichText, Sense, TextureHandle, Vec2};
 use zeroize::Zeroize;
 
@@ -160,6 +161,10 @@ struct App {
 	server: Option<api_server::Server>,
 	api_note: Option<String>,
 	api_started: bool,
+	taste_brief: String,
+	taste_note: Option<String>,
+	cookie_host: String,
+	cookie_text: String,
 	store: Arc<Mutex<Store>>,
 	worker: Worker,
 	query: String,
@@ -246,6 +251,10 @@ impl App {
 		store.auto_links = settings.auto_links;
 		let store = Arc::new(Mutex::new(store));
 		let favorites = store.lock().unwrap().favorite_keys().unwrap_or_default();
+		let taste_brief = store.lock().unwrap().value("taste_brief").ok().flatten().unwrap_or_default();
+		for (host, header, _) in store.lock().unwrap().cookies().unwrap_or_default() {
+			bettersearch_core::sites::set_cookie(&host, &header);
+		}
 		let worker = Worker::spawn(ctx.clone(), store.clone());
 		App {
 			sites: settings::make_sites(&settings),
@@ -253,6 +262,10 @@ impl App {
 			server: None,
 			api_note: None,
 			api_started: false,
+			taste_brief,
+			taste_note: None,
+			cookie_host: String::new(),
+			cookie_text: String::new(),
 			query: settings.last_search.clone(),
 			settings,
 			settings_open: false,
@@ -311,6 +324,62 @@ impl App {
 		self.urgent = true;
 	}
 
+	/// Runs the kind of searches the profile points at, together.
+	fn refresh_picks(&mut self) {
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+		let built = {
+			let store = self.store.lock().unwrap();
+			taste::build(&store, &self.settings.ratings, now, self.settings.taste.dial_override)
+		};
+		let Ok(profile) = built else {
+			self.taste_note = Some("Couldn't read your taste.".into());
+			return;
+		};
+		if profile.tags.is_empty() {
+			self.taste_note = Some("Nothing to go on yet: favorite a few posts, or make a group.".into());
+			return;
+		}
+		let Ok(queries) = taste::queries(&profile, &self.settings.ratings, 4) else {
+			self.taste_note = Some("Couldn't build searches.".into());
+			return;
+		};
+		if queries.is_empty() {
+			self.taste_note = Some("Nothing to search for yet.".into());
+			return;
+		}
+		self.taste_note = None;
+		self.query = queries.iter().map(|q| format!("({q})")).collect::<Vec<_>>().join(" | ");
+		self.search();
+	}
+
+	/// Asks the model for a new brief from the current profile.
+	fn write_brief(&mut self) {
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+		let built = {
+			let store = self.store.lock().unwrap();
+			taste::build(&store, &self.settings.ratings, now, self.settings.taste.dial_override)
+		};
+		let profile = match built {
+			Ok(p) if !p.tags.is_empty() => p,
+			_ => {
+				self.taste_note = Some("Nothing to describe yet.".into());
+				return;
+			}
+		};
+		let tags: Vec<String> = profile.tags.iter().take(40).map(|t| t.tag.clone()).collect();
+		let t = &self.settings.taste;
+		match taste::brief(&t.endpoint, &t.api_key, &t.model, &tags, profile.dial) {
+			Ok(text) => {
+				self.taste_brief = text.clone();
+				if let Ok(store) = self.store.lock() {
+					let _ = store.set_value("taste_brief", &text);
+				}
+				self.taste_note = None;
+			}
+			Err(e) => self.taste_note = Some(e.to_string()),
+		}
+	}
+
 	/// Starts, restarts or stops the local API to match the settings.
 	fn sync_api(&mut self) {
 		self.server = None;
@@ -331,6 +400,7 @@ impl App {
 
 	/// Writes the vault one last time; called on lock and exit.
 	fn shutdown(&mut self) {
+		bettersearch_core::sites::clear_cookies();
 		self.server = None;
 		self.save_settings();
 		self.saver.flush(&self.store);
@@ -351,10 +421,40 @@ impl App {
 		self.search_on(sites);
 	}
 
+	/// Copies fresh clearance cookies out of the browser for these sites, at
+	/// most every ten minutes each.
+	fn refresh_cookies(&mut self, sites: &[Arc<dyn Site>]) {
+		if !self.settings.browser_cookies {
+			return;
+		}
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+		let known: std::collections::HashMap<String, i64> = {
+			let store = self.store.lock().unwrap();
+			store.cookies().unwrap_or_default().into_iter().map(|(h, _, at)| (h, at)).collect()
+		};
+		let hosts: Vec<String> = sites
+			.iter()
+			.map(|s| cookies::host_of(s.base()))
+			.filter(|h| !h.is_empty())
+			.filter(|h| now - known.get(h).copied().unwrap_or(0) > 600)
+			.collect();
+		if hosts.is_empty() {
+			return;
+		}
+		for (host, header, n) in cookies::harvest(&hosts) {
+			bettersearch_core::sites::set_cookie(&host, &header);
+			if let Ok(store) = self.store.lock() {
+				let _ = store.set_cookie(&host, &header);
+			}
+			let _ = n;
+		}
+	}
+
 	fn search_on(&mut self, sites: Vec<Arc<dyn Site>>) {
 		if sites.is_empty() {
 			return;
 		}
+		self.refresh_cookies(&sites);
 		self.new_results();
 		self.settings.last_search = self.query.clone();
 		self.save_settings();
@@ -901,6 +1001,11 @@ impl App {
 					});
 				if ui.button("♥").on_hover_text("Your favorites (kept on this computer)").clicked() {
 					actions.push(Action::ShowFavorites);
+				}
+				if self.settings.taste.enabled
+					&& ui.button("✨").on_hover_text("Picks from what you like (Settings → Taste)").clicked()
+				{
+					self.refresh_picks();
 				}
 				if ui.add_enabled(!self.query.trim().is_empty(), egui::Button::new("☆ Save")).on_hover_text("Save this search").clicked() {
 					actions.push(Action::OpenSave);
@@ -1682,6 +1787,71 @@ impl App {
 			if ui.button("Check logins").on_hover_text("Ask each site whether it accepts the login above").clicked() {
 				check_logins = true;
 			}
+			ui.add_space(8.0);
+			ui.separator();
+			ui.strong("Blocked sites");
+			ui.label(
+				RichText::new(
+					"Some boorus challenge anything that isn't a browser. Open the site once in LibreWolf or Firefox, then copy its cookie here: \
+					the app reads it out of that profile, keeps it in the vault and sends it, so searches work.",
+				)
+				.weak(),
+			);
+			let mut borrow = self.settings.browser_cookies;
+			if ui.checkbox(&mut borrow, "Use my browser's cookies").changed() {
+				self.settings.browser_cookies = borrow;
+				self.save_settings();
+			}
+			ui.horizontal(|ui| {
+				ui.label("Or paste for");
+				ui.add(egui::TextEdit::singleline(&mut self.cookie_host).hint_text("booru.example").desired_width(160.0));
+			});
+			ui.horizontal(|ui| {
+				ui.add(egui::TextEdit::singleline(&mut self.cookie_text).hint_text("cf_clearance=…; other=…").desired_width(280.0));
+				if ui.small_button("Keep").clicked() {
+					let host = self.cookie_host.trim().trim_start_matches('.').to_lowercase();
+					let header = self.cookie_text.trim().to_string();
+					if host.is_empty() || header.is_empty() {
+						self.api_note = Some("Needs a host and a Cookie header.".into());
+					} else {
+						bettersearch_core::sites::set_cookie(&host, &header);
+						if let Ok(store) = self.store.lock() {
+							let _ = store.set_cookie(&host, &header);
+						}
+						self.cookie_text.clear();
+					}
+				}
+			});
+			if ui.button("Copy cookies now").on_hover_text("Needs a Firefox or LibreWolf profile on this computer").clicked() {
+				let hosts: Vec<String> = self.current_sites().iter().map(|s| cookies::host_of(s.base())).filter(|h| !h.is_empty()).collect();
+				let mut got = 0;
+				for (host, header, _) in cookies::harvest(&hosts) {
+					bettersearch_core::sites::set_cookie(&host, &header);
+					if let Ok(store) = self.store.lock() {
+						let _ = store.set_cookie(&host, &header);
+					}
+					got += 1;
+				}
+				self.api_note = Some(if got == 0 {
+					"None found. Firefox and LibreWolf keep cookies on disk; Wisp keeps its session in memory, so use Paste below for it.".into()
+				} else {
+					format!("Copied cookies for {got} site(s).")
+				});
+			}
+			let hosts = bettersearch_core::sites::cookie_hosts();
+			if hosts.is_empty() {
+				ui.label(RichText::new("No cookies held.").weak());
+			} else {
+				ui.label(RichText::new(format!("Holding cookies for: {}", hosts.join(", "))).weak());
+				if ui.small_button("Forget them").clicked() {
+					bettersearch_core::sites::clear_cookies();
+					if let Ok(store) = self.store.lock() {
+						for h in &hosts {
+							let _ = store.delete_cookie(h);
+						}
+					}
+				}
+			}
 			for (site, answer) in self.login_checks.lock().unwrap().iter() {
 				match answer {
 					Ok(who) => ui.label(RichText::new(format!("{site}: logged in as {who} ✓")).color(Color32::from_rgb(110, 200, 120))),
@@ -1696,6 +1866,60 @@ impl App {
 				.checkbox(&mut self.settings.show_imageless, "Show posts the site sent without images")
 				.on_hover_text("e621 leaves the images out for logged-out users on posts with tags from its default blacklist. Logging in above shows them.")
 				.changed();
+			ui.add_space(8.0);
+			ui.separator();
+			ui.strong("Taste");
+			ui.label(RichText::new("Reads your favorites, searches and groups, and searches for more of the same. The model only writes the description; the numbers stay in charge.").weak());
+			let mut taste_on = self.settings.taste.enabled;
+			if ui.checkbox(&mut taste_on, "Show the ✨ picks button").changed() {
+				self.settings.taste.enabled = taste_on;
+				self.save_settings();
+			}
+			if self.settings.taste.enabled {
+				if !self.taste_brief.is_empty() {
+					ui.group(|ui| {
+						ui.label(RichText::new(&self.taste_brief).italics());
+					});
+				}
+				ui.horizontal(|ui| {
+					ui.label("Model address");
+					changed |= ui.text_edit_singleline(&mut self.settings.taste.endpoint).changed();
+					if ui.small_button("Venice").clicked() {
+						self.settings.taste.endpoint = "https://api.venice.ai/api/v1".into();
+						self.settings.taste.provider = settings::Provider::Venice;
+						changed = true;
+					}
+				});
+				ui.horizontal(|ui| {
+					ui.label("API key ");
+					changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.taste.api_key).password(true)).changed();
+				});
+				ui.horizontal(|ui| {
+					ui.label("Model");
+					changed |= ui.text_edit_singleline(&mut self.settings.taste.model).changed();
+				});
+				ui.horizontal(|ui| {
+					let mut mine = self.settings.taste.dial_override.is_some();
+					if ui.checkbox(&mut mine, "Set how far it leans").changed() {
+						self.settings.taste.dial_override = mine.then_some(5.0);
+						changed = true;
+					}
+					if let Some(dial) = self.settings.taste.dial_override.as_mut() {
+						changed |= ui.add(egui::Slider::new(dial, 0.0..=10.0).show_value(false)).changed();
+					}
+				});
+				ui.horizontal(|ui| {
+					if ui.button("Write brief").clicked() {
+						self.write_brief();
+					}
+					if ui.button("Find picks").clicked() {
+						self.refresh_picks();
+					}
+				});
+				if let Some(n) = &self.taste_note {
+					ui.label(RichText::new(n).weak());
+				}
+			}
 			ui.add_space(8.0);
 			ui.separator();
 			ui.strong("Local API");

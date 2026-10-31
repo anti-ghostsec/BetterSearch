@@ -74,6 +74,8 @@ pub struct Page {
 pub trait Site: Send + Sync {
 	/// Stable id used in item keys: "e621".
 	fn id(&self) -> &str;
+	/// The site's address, for cookies and for sorting out where a file came from.
+	fn base(&self) -> &str;
 	fn name(&self) -> &str;
 	fn caps(&self) -> Capabilities;
 	/// One page of a query in the site's own syntax. `cursor: None` is the first page.
@@ -123,6 +125,61 @@ pub trait Site: Send + Sync {
 	}
 }
 
+/// Cookies harvested from the user's own browser, by host.
+///
+/// Some boorus answer a plain client with an interactive challenge. The app has
+/// no browser, so it borrows the one that's already there: the visitor passes
+/// it once in LibreWolf or Firefox and the clearance is copied out of that
+/// profile's cookie database into the vault. Kept in memory here.
+static JAR: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+
+fn jar() -> &'static std::sync::RwLock<std::collections::HashMap<String, String>> {
+	JAR.get_or_init(Default::default)
+}
+
+pub fn set_cookie(host: &str, header: &str) {
+	let host = host.trim().trim_start_matches('.').to_lowercase();
+	if host.is_empty() || header.trim().is_empty() {
+		return;
+	}
+	jar().write().unwrap_or_else(|e| e.into_inner()).insert(host, header.trim().to_string());
+}
+
+pub fn clear_cookies() {
+	jar().write().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+pub fn cookie_hosts() -> Vec<String> {
+	jar().read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+}
+
+/// The host of an https URL, without port, userinfo or path.
+pub fn host_of(url: &str) -> Option<&str> {
+	let rest = url.split_once("://")?.1;
+	let host = rest.split(['/', '?', '#']).next()?;
+	let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+	let host = host.split(':').next()?;
+	(!host.is_empty()).then_some(host)
+}
+
+/// The longest stored cookie host that `url` belongs to (`bo.ru` or `a.bo.ru`).
+pub fn cookie_for(url: &str) -> Option<String> {
+	let host = host_of(url)?.to_lowercase();
+	let jar = jar().read().unwrap_or_else(|e| e.into_inner());
+	jar.iter()
+		.filter(|(k, _)| host == **k || host.ends_with(&format!(".{k}")))
+		.max_by_key(|(k, _)| k.len())
+		.map(|(_, v)| v.clone())
+}
+
+/// Attaches the borrowed cookie, if there is one for this host.
+pub fn with_cookie(req: reqwest::blocking::RequestBuilder, url: &str) -> reqwest::blocking::RequestBuilder {
+	match cookie_for(url) {
+		Some(cookie) => req.header(reqwest::header::COOKIE, cookie),
+		None => req,
+	}
+}
+
 /// Most bytes one image or video download may bring in.
 pub const MAX_DOWNLOAD: u64 = 400 * 1024 * 1024;
 
@@ -140,7 +197,7 @@ pub fn download_with(client: &reqwest::blocking::Client, url: &str, referer: Opt
 	if !url.starts_with("https://") {
 		return Err(crate::Error::Query("only https links are downloaded".into()));
 	}
-	let mut req = client.get(url);
+	let mut req = with_cookie(client.get(url), url);
 	if let Some(referer) = referer {
 		req = req.header(reqwest::header::REFERER, referer);
 	}

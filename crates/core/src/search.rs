@@ -476,6 +476,9 @@ mod tests {
 		fn name(&self) -> &str {
 			"Fake"
 		}
+		fn base(&self) -> &str {
+			"https://example.invalid"
+		}
 		fn caps(&self) -> Capabilities {
 			Capabilities { max_tags: 2, tilde_or: false, max_wildcards: 1, metas: &["rating"], free_metas: &[], page_size: 2 }
 		}
@@ -592,6 +595,9 @@ mod tests {
 		}
 		fn name(&self) -> &str {
 			"Echo"
+		}
+		fn base(&self) -> &str {
+			"https://example.invalid"
 		}
 		fn caps(&self) -> Capabilities {
 			Capabilities { max_tags: 10, tilde_or: true, max_wildcards: 1, metas: &["rating"], free_metas: &[], page_size: 3 }

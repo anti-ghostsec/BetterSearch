@@ -291,6 +291,55 @@ pub fn queries(taste: &Taste, ratings: &[Rating], want: usize) -> Result<Vec<Str
 	Ok(out)
 }
 
+/// Asks an OpenAI-compatible model (Venice by default) for the exaggerated
+/// brief. Only tags from `tags` survive, so the prose can't invent vocabulary
+/// the site doesn't have. `dial` sets how hard it leans in.
+pub fn brief(endpoint: &str, key: &str, model: &str, tags: &[String], dial: f32) -> Result<String> {
+	if model.trim().is_empty() {
+		return Err(crate::Error::Query("no model chosen".into()));
+	}
+	let leaning = if dial >= 7.0 {
+		"Write it as a breathless critic who is certain: lean hard into how adult it gets, use superlatives, commit."
+	} else if dial >= 4.0 {
+		"Write it as a sharp critic: interested, specific, not shy about the spicy parts."
+	} else {
+		"Write it warmly but plainly, like a bookseller who knows the customer."
+	};
+	let system = format!(
+		"You describe someone's taste in booru art from their own saved tags. {leaning} \
+		 Two or three sentences, present tense, second person (\"you\"). \
+		 Only use tag names from the list you're given; you may describe what they mean."
+	);
+	let body = serde_json::json!({
+		"model": model,
+		"max_tokens": 220,
+		"temperature": 0.9,
+		"messages": [
+			{ "role": "system", "content": system },
+			{ "role": "user", "content": tags.join(", ") },
+		]
+	});
+	let client = reqwest::blocking::Client::builder()
+		.timeout(std::time::Duration::from_secs(60))
+		.build()
+		.map_err(|e| crate::Error::Query(e.to_string()))?;
+	let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+	let mut req = client.post(&url).json(&body);
+	if !key.trim().is_empty() {
+		req = req.bearer_auth(key.trim());
+	}
+	let res = req.send().map_err(|e| crate::Error::Query(format!("model unreachable: {e}")))?;
+	if !res.status().is_success() {
+		return Err(crate::Error::Query(format!("the model said {}", res.status())));
+	}
+	let value: serde_json::Value = res.json().map_err(|e| crate::Error::Query(e.to_string()))?;
+	let text = value["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string();
+	if text.is_empty() {
+		return Err(crate::Error::Query("the model answered nothing".into()));
+	}
+	Ok(text)
+}
+
 /// `rank`s used by the app to order `why` chips: character, species, general.
 pub fn anchor_rank(category: Category) -> u8 {
 	category.rank()

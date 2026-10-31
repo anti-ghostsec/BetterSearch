@@ -124,7 +124,8 @@ impl Gelbooru {
 
 	fn get(&self, path: &str, query: &[(&str, String)]) -> Result<String> {
 		self.throttle.wait();
-		let mut req = self.client.get(format!("{}{path}", self.base)).query(query);
+		let url = format!("{}{path}", self.base);
+		let mut req = super::with_cookie(self.client.get(url), &format!("{}{path}", self.base)).query(query);
 		if let Some((user, key)) = &self.login {
 			req = req.query(&[("user_id", user), ("api_key", key)]);
 		}
@@ -361,6 +362,10 @@ impl Site for Gelbooru {
 
 	fn name(&self) -> &str {
 		&self.name
+	}
+
+	fn base(&self) -> &str {
+		&self.base
 	}
 
 	fn caps(&self) -> Capabilities {

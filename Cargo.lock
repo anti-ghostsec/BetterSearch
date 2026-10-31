@@ -435,6 +435,7 @@ dependencies = [
  "eframe",
  "image",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "zeroize",
