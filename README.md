@@ -62,7 +62,10 @@ the vault and sent to that host only, and searches work from then on until it
 expires.
 
 Wisp keeps its session in memory, so there is no file to read — paste is the
-way for it. `cf_clearance` usually lasts hours, not days.
+way for it. `cf_clearance` usually lasts hours, not days. Cloudflare ties it to the browser's
+User-Agent, so the app sends a Firefox one on hosts it holds a cookie for
+instead of its own; if the browser's version differs a lot the cookie can still
+be refused, in which case paste again.
 
 The app copies clearance cookies by itself for the sites it is about to search
 when a stored one is over ten minutes old, so a working cookie keeps working

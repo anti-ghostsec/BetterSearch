@@ -172,10 +172,15 @@ pub fn cookie_for(url: &str) -> Option<String> {
 		.map(|(_, v)| v.clone())
 }
 
-/// Attaches the borrowed cookie, if there is one for this host.
+/// The UA a clearance cookie was earned under. Cloudflare ties `cf_clearance`
+/// to it, so a cookie sent with the app's own UA is refused.
+const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
+
+/// Attaches the borrowed cookie, if there is one for this host, and the
+/// matching UA. Sites without a cookie keep the app's own UA.
 pub fn with_cookie(req: reqwest::blocking::RequestBuilder, url: &str) -> reqwest::blocking::RequestBuilder {
 	match cookie_for(url) {
-		Some(cookie) => req.header(reqwest::header::COOKIE, cookie),
+		Some(cookie) => req.header(reqwest::header::COOKIE, cookie).header(reqwest::header::USER_AGENT, BROWSER_UA),
 		None => req,
 	}
 }
