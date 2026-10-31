@@ -1,4 +1,6 @@
 /target/
+__pycache__/
+*.pyc
 # App data lives in ~/.local/share/bettersearch, never here; just in case:
 *.db
 *.db-wal
