@@ -31,9 +31,9 @@ those four APIs: the address, a name, and the API family. https only, and the
 address is the site root, not a page. They're searched like the built-ins and
 can be removed again. Logins are optional and only for sites that need one.
 
-Rule34.xxx, furry.booru.org and safebooru.donmai.us currently answer
-Cloudflare's challenge to plain clients, so they can't be added until a way
-past that exists. Paheal answers HTML rather than its API.
+Rule34.xxx, furry.booru.org and safebooru.donmai.us currently
+answer an interactive challenge to plain clients, so they can't be added until
+a cookie import exists. Paheal answers HTML rather than its API.
 
 On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
 `safe`), and `sensitive` counts as *Questionable*. Danbooru's 2-tag limit
