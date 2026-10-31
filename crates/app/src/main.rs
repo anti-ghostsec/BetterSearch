@@ -2,6 +2,8 @@
 // between tags. The engine lives in bettersearch-core; this is the window.
 // Everything it keeps is in an encrypted vault, opened with a PIN (lock.rs).
 
+#[allow(dead_code)]
+mod cache;
 mod groups;
 mod lock;
 mod media;

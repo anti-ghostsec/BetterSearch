@@ -254,6 +254,12 @@ are only ever in memory.
 - ⚙ Settings has **Lock now** and **Clear search history**. Deleting (a saved
   search, history, a link) overwrites the data inside the database, and each
   unlock compacts it, so nothing deleted is carried into the next vault.
+- **One file.** `vault.bin` is the only thing the app writes in normal use.
+  SQLite's temporary files, sorts and `VACUUM` copy are `MEMORY`; thumbnails,
+  video playback (a `memfd`) and the local API's image cache never leave RAM.
+  Setting the local API up may write one more file, `api.json`, holding only
+  the port and its bearer token so another program can find it — no history,
+  no view data, no account; it's removed when the API is switched off.
 - Data from before the vault (`bettersearch.db`, `settings.json`) is moved in
   on first run and the plain files are deleted once the vault reads back.
   Deleting doesn't scrub the disk, so old copies may linger in free space.
