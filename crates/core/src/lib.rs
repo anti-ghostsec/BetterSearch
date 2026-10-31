@@ -2,6 +2,7 @@
 // planner that turns a search into queries a booru can run, site adapters,
 // the local post cache and the tag graph (personal tags and links).
 
+pub mod api;
 pub mod multi;
 mod plan;
 pub mod learn;
