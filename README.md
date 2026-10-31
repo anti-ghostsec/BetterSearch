@@ -17,7 +17,7 @@ Settings; e621 asks every app to say who runs it.
 | e926, e621 | optional (API key) |
 | Danbooru | optional: without one, searches take 2 tags (Gold 6, Platinum 12) |
 | Safebooru | not needed |
-| Gelbooru | required: user id and API key from its account options page; its images still can't be shown here (see below) |
+| Gelbooru | required: user id and API key from its account options page |
 
 On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
 `safe`), and `sensitive` counts as *Questionable*. Danbooru's 2-tag limit
@@ -223,13 +223,12 @@ anyway. With your e621 username and API key in Settings, e621 sends them;
 **Check logins** there asks each site whether it accepts your login. With an
 API key but no login name, the name at the top of Settings is used.
 
-**Gelbooru's images.** gelbooru.com's image servers only serve its own
-website: an app asking for an image gets sent to a "hotlink" page instead,
-API key or not. Searching works; the pictures don't, so Gelbooru tiles say so
-and "Open page" shows the post in your browser. The app doesn't pretend to be
-gelbooru.com to get around that. Most Gelbooru posts are copies from
-Danbooru: with both ticked, the same file shows once, and the copy whose
-image can be shown is kept.
+**Gelbooru's images.** gelbooru.com's image servers serve the site itself only:
+an app asking for an image is redirected to its post list. The app sends the
+site as the `Referer` for its own image hosts, which is all it takes — the
+pictures show like anywhere else. (Only to `gelbooru.com` hosts; nothing else
+sees where a file came from.) Most Gelbooru posts are copies from Danbooru:
+with both ticked, the same file shows once.
 
 ## Privacy: the vault
 

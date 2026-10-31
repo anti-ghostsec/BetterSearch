@@ -429,9 +429,10 @@ impl Site for Gelbooru {
 		Some(self.dapi("post", vec![("json", "1".into()), ("limit", "1".into())]).map(|_| format!("user {user}")))
 	}
 
-	/// gelbooru.com's image servers refuse apps (hotlink protection); Safebooru's don't.
+	/// gelbooru.com's image servers only serve their own pages; a `Referer` of
+	/// the site fixes it, so images show like anywhere else.
 	fn shows_images(&self) -> bool {
-		self.id != "gelbooru"
+		true
 	}
 
 	/// Safebooru has no explicit posts.
@@ -439,9 +440,16 @@ impl Site for Gelbooru {
 		(self.id == "safebooru").then_some(&[Rating::Safe, Rating::Questionable][..])
 	}
 
+	/// Its image servers check the referer, so send it — but only to the site's
+	/// own hosts, so nothing else learns where the file came from.
 	fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
 		self.image_throttle.wait();
-		super::download(&self.client, url)
+		let referer = format!("{}/", self.base);
+		let own = url
+			.split_once("//")
+			.and_then(|(_, rest)| rest.split('/').next())
+			.is_some_and(|host| host == "gelbooru.com" || host.ends_with(".gelbooru.com"));
+		super::download_with(&self.client, url, own.then_some(referer.as_str()))
 	}
 }
 

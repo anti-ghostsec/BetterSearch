@@ -128,10 +128,21 @@ pub const MAX_DOWNLOAD: u64 = 400 * 1024 * 1024;
 /// files, no plain-text links), and never more than `MAX_DOWNLOAD`, so a
 /// broken or hostile server can't fill the memory.
 pub fn download(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
+	download_with(client, url, None)
+}
+
+/// `download`, with a `Referer` for sites whose image servers only serve their
+/// own pages. Gelbooru answers anything without one with a redirect to its post
+/// list, so the referer is required there, not a nicety.
+pub fn download_with(client: &reqwest::blocking::Client, url: &str, referer: Option<&str>) -> Result<Vec<u8>> {
 	if !url.starts_with("https://") {
 		return Err(crate::Error::Query("only https links are downloaded".into()));
 	}
-	let res = client.get(url).send()?.error_for_status()?;
+	let mut req = client.get(url);
+	if let Some(referer) = referer {
+		req = req.header(reqwest::header::REFERER, referer);
+	}
+	let res = req.send()?.error_for_status()?;
 	// A redirect mustn't land on plain http.
 	if res.url().scheme() != "https" {
 		return Err(crate::Error::Query("the download was redirected off https".into()));
@@ -207,15 +218,19 @@ mod tests {
 		assert!(!shown.contains("SECRET123") && !shown.contains("user_id"), "{shown}");
 	}
 
-	/// Live: Gelbooru's image servers answer apps with their hotlink page;
-	/// that's a clear error, not a picture that never loads.
+	/// Live: Gelbooru's image servers are in place again: without the referer
+	/// they answer with their post list, with it they send the file.
 	/// `cargo test -p bettersearch-core -- --ignored` (needs the network).
 	#[test]
 	#[ignore]
-	fn gelbooru_hotlink_is_an_error() {
+	fn gelbooru_image_needs_the_referer() {
 		let client = reqwest::blocking::Client::builder().user_agent(user_agent("")).build().unwrap();
-		let e = download(&client, "https://img4.gelbooru.com/thumbnails/d5/09/thumbnail_d509cffc5c68c66faffc09617d575749.jpg").unwrap_err();
+		let url = "https://img4.gelbooru.com/thumbnails/d5/09/thumbnail_d509cffc5c68c66faffc09617d575749.jpg";
+		let e = download(&client, url).unwrap_err();
 		assert!(e.to_string().contains("web page instead of the image"), "{e}");
-	}
 
+		let site = crate::sites::gelbooru::Gelbooru::gelbooru("test").unwrap();
+		let bytes = site.fetch_bytes(url).unwrap();
+		assert_eq!(&bytes[..3], b"\xff\xd8\xff", "not a JPEG");
+	}
 }
