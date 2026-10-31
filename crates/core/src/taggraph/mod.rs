@@ -862,7 +862,7 @@ mod tests {
 	use super::*;
 
 	fn setup() -> (Connection, Options) {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = crate::wipe::open_in_memory().unwrap();
 		conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
 		let opts = Options::default();
 		TagGraph::migrate(&conn, &opts).unwrap();
@@ -938,7 +938,7 @@ mod tests {
 
 	#[test]
 	fn suggests_links_made_before() {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = crate::wipe::open_in_memory().unwrap();
 		let opts = Options::default();
 		TagGraph::migrate(&conn, &opts).unwrap();
 		let g = TagGraph::new(&conn, &opts);

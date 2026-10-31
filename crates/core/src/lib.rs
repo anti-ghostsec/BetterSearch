@@ -12,6 +12,7 @@ pub mod search;
 pub mod sites;
 pub mod store;
 pub mod taggraph;
+mod wipe;
 
 pub use multi::MultiSearch;
 pub use plan::{Plan, plan};

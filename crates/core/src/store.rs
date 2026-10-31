@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
+use zeroize::Zeroizing;
 
 use crate::post::Post;
 use crate::query::{Expr, Subject, compare, parse};
 use crate::taggraph::{ItemLink, LinkSuggestion, Options, TagGraph};
-use crate::{Error, Rating, Result};
+use crate::{Error, Rating, Result, wipe};
 
 pub struct Store {
 	conn: Connection,
@@ -40,34 +41,36 @@ const KEEP_POSTS: usize = 5000;
 
 impl Store {
 	pub fn open(path: &Path) -> Result<Store> {
-		Self::with(Connection::open(path)?)
+		Self::with(wipe::open(path)?)
 	}
 
 	pub fn in_memory() -> Result<Store> {
-		Self::with(Connection::open_in_memory()?)
+		Self::with(wipe::open_in_memory()?)
 	}
 
 	/// A database from `to_bytes`, held in memory.
 	pub fn from_bytes(bytes: &[u8]) -> Result<Store> {
-		let mut conn = Connection::open_in_memory()?;
+		let mut conn = wipe::open_in_memory()?;
 		conn.deserialize_read_exact(MAIN_DB, bytes, bytes.len(), false)?;
+		let store = Self::with(conn)?;
 		// Rewrites the database without its free pages, so anything deleted
 		// before secure delete was on is gone from the next save.
-		conn.execute_batch("VACUUM")?;
-		Self::with(conn)
+		store.conn.execute_batch("VACUUM")?;
+		Ok(store)
 	}
 
-	/// The whole database as bytes, for writing out (encrypted) and reading back with `from_bytes`.
-	pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
-		Ok(self.conn.serialize(MAIN_DB)?.to_vec())
+	/// The whole database as bytes, for writing out (encrypted) and reading
+	/// back with `from_bytes`. Wiped from memory when dropped.
+	pub fn to_bytes(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+		Ok(Zeroizing::new(self.conn.serialize(MAIN_DB)?.to_vec()))
 	}
 
 	/// Reads a database file from before it was kept in memory.
 	pub fn import_file(path: &Path) -> Result<Store> {
-		let mut conn = Connection::open(path)?;
+		let mut conn = wipe::open(path)?;
 		// Folds the WAL in; a WAL-mode copy won't open from bytes.
 		conn.execute_batch("PRAGMA journal_mode = DELETE")?;
-		let bytes = conn.serialize(MAIN_DB)?.to_vec();
+		let bytes = Zeroizing::new(conn.serialize(MAIN_DB)?.to_vec());
 		drop(conn);
 		Self::from_bytes(&bytes)
 	}
@@ -81,6 +84,9 @@ impl Store {
 		conn.execute_batch(
 			"PRAGMA foreign_keys = ON;
 			PRAGMA secure_delete = ON;
+			-- Sorts, temporary tables and VACUUM's working copy stay in memory,
+			-- never in temporary files on disk.
+			PRAGMA temp_store = MEMORY;
 			CREATE TABLE IF NOT EXISTS posts (
 				key TEXT PRIMARY KEY,
 				site TEXT NOT NULL,

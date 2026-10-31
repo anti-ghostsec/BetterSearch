@@ -19,6 +19,7 @@ use bettersearch_core::store::RelationState;
 use bettersearch_core::taggraph::{ItemLink, ItemTag, LinkSuggestion};
 use bettersearch_core::{Post, Rating, Site, Store, TagSuggestion};
 use eframe::egui::{self, Color32, RichText, Sense, TextureHandle, Vec2};
+use zeroize::Zeroize;
 
 use groups::Groups;
 use lock::{Root, Saver};
@@ -1650,8 +1651,8 @@ impl App {
 					Err(e) => e.to_string(),
 				}
 			});
-			self.new_pin.clear();
-			self.new_pin_again.clear();
+			self.new_pin.zeroize();
+			self.new_pin_again.zeroize();
 		}
 		if changed {
 			self.save_settings();

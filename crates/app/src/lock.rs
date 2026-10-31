@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use bettersearch_core::Store;
 use eframe::egui::{self, Color32, RichText};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::App;
 use crate::settings::{Settings, data_dir};
@@ -86,7 +86,7 @@ impl Saver {
 		match bytes {
 			Ok(b) => {
 				if let Some(tx) = &self.tx {
-					let _ = tx.send((self.key.clone(), Zeroizing::new(b)));
+					let _ = tx.send((self.key.clone(), b));
 				}
 			}
 			Err(e) => *self.error.lock().unwrap() = Some(e.to_string()),
@@ -130,8 +130,27 @@ type Opened = Result<(Arc<Key>, Store), (String, bool)>;
 
 enum State {
 	Locked(LockScreen),
-	Busy(Receiver<Opened>, &'static str, u32),
+	/// Making a key off the window's thread (it takes a second). `renew`: the
+	/// PIN was shorter than `MIN_PIN`, so a new one is asked for once it opens.
+	Busy {
+		rx: Receiver<Opened>,
+		label: &'static str,
+		fails: u32,
+		renew: bool,
+	},
+	/// Opened with a PIN from when 4 characters were enough: a new one is
+	/// chosen before anything else.
+	Renew(LockScreen, Box<Store>),
 	Open(Box<App>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+	/// No vault yet: choose a PIN.
+	First,
+	Unlock,
+	/// Opened with a short PIN: choose a new one.
+	Renew,
 }
 
 pub struct Root {
@@ -145,23 +164,34 @@ impl Root {
 		Root { ctx, vault: Vault::in_dir(&data_dir()), state: State::Locked(LockScreen::default()) }
 	}
 
-	fn start(&mut self, pin: String, first: bool, fails: u32) {
+	/// Runs `job` on its own thread, showing `label` meanwhile.
+	fn run(&mut self, label: &'static str, fails: u32, renew: bool, job: impl FnOnce(&Vault) -> Opened + Send + 'static) {
 		let (tx, rx) = channel();
-		let vault = self.vault.clone();
-		let ctx = self.ctx.clone();
+		let (vault, ctx) = (self.vault.clone(), self.ctx.clone());
 		std::thread::spawn(move || {
-			let pin = Zeroizing::new(pin);
-			let opened = if first { create(&vault, &pin) } else { open(&vault, &pin) };
-			let _ = tx.send(opened);
+			let _ = tx.send(job(&vault));
 			ctx.request_repaint();
 		});
-		self.state = State::Busy(rx, if first { "Setting up…" } else { "Unlocking…" }, fails);
+		self.state = State::Busy { rx, label, fails, renew };
+	}
+
+	/// What the PIN screen is for, when it's showing.
+	fn mode(&self) -> Option<Mode> {
+		match &self.state {
+			State::Locked(_) if self.vault.exists() => Some(Mode::Unlock),
+			State::Locked(_) => Some(Mode::First),
+			State::Renew(..) => Some(Mode::Renew),
+			_ => None,
+		}
 	}
 
 	fn lock_screen(&mut self, ui: &mut egui::Ui) {
-		let first = !self.vault.exists();
+		let Some(mode) = self.mode() else {
+			return;
+		};
+		let choosing = mode != Mode::Unlock;
 		let now = ui.input(|i| i.time);
-		let State::Locked(s) = &mut self.state else {
+		let (State::Locked(s) | State::Renew(s, _)) = &mut self.state else {
 			return;
 		};
 		let mut go = false;
@@ -176,22 +206,26 @@ impl Root {
 				ui.vertical_centered(|ui| {
 				ui.heading(RichText::new("BetterSearch").size(28.0));
 				ui.add_space(12.0);
-				if first {
-					ui.label("Choose a PIN. Your settings, search history, links and the posts you've seen are kept encrypted with it, and only unlocked in memory while the app is open.");
-					ui.add_space(6.0);
-					ui.label(
-						RichText::new(
-							"There's no way back in without it. A 4-digit PIN keeps out someone glancing at your files, but \
-							someone who copies them could try all 10,000 within hours, faster on a strong computer; 6+ digits or a passphrase hold up far longer.",
-						)
-						.weak(),
-					);
-					if data_dir().join("bettersearch.db").exists() || Settings::legacy_path().exists() {
+				match mode {
+					Mode::First => {
+						ui.label("Choose a PIN. Your settings, search history, links and the posts you've seen are kept encrypted with it, and only unlocked in memory while the app is open.");
 						ui.add_space(6.0);
-						ui.label(RichText::new("Your existing data will be moved in, and the old unencrypted files deleted.").weak());
+						ui.label(RichText::new(PIN_ADVICE).weak());
+						if data_dir().join("bettersearch.db").exists() || Settings::legacy_path().exists() {
+							ui.add_space(6.0);
+							ui.label(RichText::new("Your existing data will be moved in, and the old unencrypted files deleted.").weak());
+						}
 					}
-				} else {
-					ui.label("Enter your PIN to unlock.");
+					Mode::Renew => {
+						ui.label(format!(
+							"Your PIN is shorter than {MIN_PIN} characters, short enough that someone with a copy of your vault file could guess it within hours. Choose a new one to go on; nothing else changes."
+						));
+						ui.add_space(6.0);
+						ui.label(RichText::new(PIN_ADVICE).weak());
+					}
+					Mode::Unlock => {
+						ui.label("Enter your PIN to unlock.");
+					}
 				}
 				ui.add_space(10.0);
 				if !ui.input(|i| i.focused) {
@@ -205,13 +239,17 @@ impl Root {
 					r.request_focus();
 				}
 				let mut enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-				if first {
+				if choosing {
 					let r = ui.add(egui::TextEdit::singleline(&mut s.confirm).id_salt("pin-again").password(true).hint_text("again").desired_width(200.0));
 					enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 				}
 				ui.add_space(6.0);
 				let waiting = now < s.retry_at;
-				let label = if first { "Set PIN" } else { "Unlock" };
+				let label = match mode {
+					Mode::First => "Set PIN",
+					Mode::Renew => "Set new PIN",
+					Mode::Unlock => "Unlock",
+				};
 				if ui.add_enabled(!waiting, egui::Button::new(label)).clicked() || (enter && !waiting) {
 					go = true;
 				}
@@ -222,7 +260,7 @@ impl Root {
 				if let Some(e) = &s.error {
 					ui.colored_label(Color32::from_rgb(220, 90, 90), e);
 				}
-				if !first {
+				if mode == Mode::Unlock {
 					ui.add_space(24.0);
 					egui::CollapsingHeader::new(RichText::new("Forgot your PIN?").weak()).show(ui, |ui| {
 						ui.label("It can't be recovered. You can erase everything and start over: links, tags, history and settings are gone for good.");
@@ -241,20 +279,56 @@ impl Root {
 			s.erase.clear();
 			return;
 		}
-		if !go {
+		if go {
+			self.submit();
+		}
+	}
+
+	/// The PIN typed in, checked and put to use: unlocking, setting up, or
+	/// replacing a short PIN.
+	fn submit(&mut self) {
+		let Some(mode) = self.mode() else {
+			return;
+		};
+		let (State::Locked(s) | State::Renew(s, _)) = &mut self.state else {
+			return;
+		};
+		if let Some(e) = pin_problem(mode, &s.pin, &s.confirm) {
+			s.error = Some(e);
 			return;
 		}
-		if s.pin.chars().count() < MIN_PIN {
-			s.error = Some(format!("Use at least {MIN_PIN} characters."));
-			return;
+		let (pin, fails) = (Zeroizing::new(std::mem::take(&mut s.pin)), s.fails);
+		s.confirm.zeroize();
+		match mode {
+			Mode::First => self.run("Setting up…", fails, false, move |v| create(v, &pin)),
+			Mode::Unlock => {
+				let renew = pin.chars().count() < MIN_PIN;
+				self.run("Unlocking…", fails, renew, move |v| open(v, &pin));
+			}
+			Mode::Renew => {
+				let State::Renew(_, store) = std::mem::replace(&mut self.state, State::Locked(LockScreen::default())) else {
+					return;
+				};
+				self.run("Saving your new PIN…", 0, false, move |v| rekey(v, &pin, *store));
+			}
 		}
-		if first && s.pin != s.confirm {
-			s.error = Some("The two don't match.".into());
-			return;
-		}
-		let (pin, fails) = (std::mem::take(&mut s.pin), s.fails);
-		s.confirm.clear();
-		self.start(pin, first, fails);
+	}
+}
+
+const PIN_ADVICE: &str = "There's no way back in without it. Someone who copies your files can try about one PIN a second per processor core: \
+	every 6-digit PIN within days, where 4 digits took hours. A few words, or a longer mix of letters and digits, holds out for years.";
+
+/// What's wrong with a PIN typed on the lock screen, if anything. Only a PIN
+/// being chosen has to be long enough: one from when 4 was the least still unlocks.
+fn pin_problem(mode: Mode, pin: &str, confirm: &str) -> Option<String> {
+	if mode == Mode::Unlock {
+		pin.is_empty().then(|| "Type your PIN first.".into())
+	} else if pin.chars().count() < MIN_PIN {
+		Some(format!("Use at least {MIN_PIN} characters."))
+	} else if pin != confirm {
+		Some("The two don't match.".into())
+	} else {
+		None
 	}
 }
 
@@ -268,10 +342,10 @@ fn create(vault: &Vault, pin: &str) -> Opened {
 		Ok(s) => s,
 		Err(e) => return fail(format!("Couldn't read the old database: {e}")),
 	};
-	if let Ok(json) = std::fs::read_to_string(Settings::legacy_path()) {
+	if let Ok(json) = std::fs::read_to_string(Settings::legacy_path()).map(Zeroizing::new) {
 		let _ = store.set_value("settings", &json);
 	}
-	let bytes = Zeroizing::new(store.to_bytes().map_err(|e| (e.to_string(), false))?);
+	let bytes = store.to_bytes().map_err(|e| (e.to_string(), false))?;
 	vault.write(&key, &bytes).map_err(|e| (e.to_string(), false))?;
 	match vault.unlock(pin) {
 		Ok((_, back)) if back.as_slice() == bytes.as_slice() => {}
@@ -290,19 +364,30 @@ fn open(vault: &Vault, pin: &str) -> Opened {
 	Ok((Arc::new(key), store))
 }
 
-impl eframe::App for Root {
-	fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+/// A key for a new PIN, and the vault sealed with it in place of the old one.
+fn rekey(vault: &Vault, pin: &str, mut store: Store) -> Opened {
+	let fail = |e: String| (e, false);
+	let key = Key::new(pin).map_err(|e| fail(e.to_string()))?;
+	let bytes = store.to_bytes().map_err(|e| fail(e.to_string()))?;
+	vault.write(&key, &bytes).map_err(|e| fail(e.to_string()))?;
+	Ok((Arc::new(key), store))
+}
+
+impl Root {
+	fn screen(&mut self, ui: &mut egui::Ui) {
 		match &mut self.state {
-			State::Locked(_) => self.lock_screen(ui),
-			State::Busy(rx, label, fails) => {
-				let label = *label;
+			State::Locked(_) | State::Renew(..) => self.lock_screen(ui),
+			State::Busy { rx, label, fails, renew } => {
+				let (label, fails, renew) = (*label, *fails, *renew);
 				match rx.try_recv() {
+					// The short PIN's key is dropped here: nothing is sealed with it again.
+					Ok(Ok((_, store))) if renew => self.state = State::Renew(LockScreen::default(), Box::new(store)),
 					Ok(Ok((key, store))) => {
 						let saver = Saver::new(self.vault.clone(), key, store.changes());
 						self.state = State::Open(Box::new(App::new(self.ctx.clone(), store, saver)));
 					}
 					Ok(Err((error, wrong))) => {
-						let fails = *fails + wrong as u32;
+						let fails = fails + wrong as u32;
 						// Each wrong PIN waits a little longer, up to half a minute.
 						let retry_at = if wrong { ui.input(|i| i.time) + f64::from(fails.min(30)) } else { 0.0 };
 						self.state = State::Locked(LockScreen { error: Some(error), fails, retry_at, ..Default::default() });
@@ -327,6 +412,12 @@ impl eframe::App for Root {
 				}
 			}
 		}
+	}
+}
+
+impl eframe::App for Root {
+	fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+		self.screen(ui);
 	}
 
 	fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -353,7 +444,7 @@ mod tests {
 			..Default::default()
 		};
 		let ctx = root.ctx.clone();
-		let mut out = ctx.run_ui(input, |ui| root.lock_screen(ui));
+		let mut out = ctx.run_ui(input, |ui| root.screen(ui));
 		out.textures_delta.clear();
 	}
 
@@ -419,4 +510,69 @@ mod tests {
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
+	fn type_pins(root: &mut Root, pin: &str, again: &str) {
+		let (State::Locked(s) | State::Renew(s, _)) = &mut root.state else {
+			panic!("the PIN screen isn't showing");
+		};
+		(s.pin, s.confirm) = (pin.into(), again.into());
+	}
+
+	fn error(root: &Root) -> Option<String> {
+		match &root.state {
+			State::Locked(s) | State::Renew(s, _) => s.error.clone(),
+			_ => None,
+		}
+	}
+
+	/// Frames until the key is made.
+	fn settle(root: &mut Root) {
+		let start = Instant::now();
+		while matches!(root.state, State::Busy { .. }) {
+			assert!(start.elapsed() < Duration::from_secs(60), "still busy");
+			std::thread::sleep(Duration::from_millis(10));
+			frame(root, vec![]);
+		}
+	}
+
+	/// A PIN being chosen needs 6 characters, and both to match.
+	#[test]
+	fn new_pins_need_six_characters() {
+		let (mut root, dir) = new_root("six");
+		type_pins(&mut root, "48291", "48291");
+		root.submit();
+		assert_eq!(error(&root).as_deref(), Some("Use at least 6 characters."));
+		type_pins(&mut root, "482913", "482914");
+		root.submit();
+		assert_eq!(error(&root).as_deref(), Some("The two don't match."));
+		assert!(matches!(root.state, State::Locked(_)) && !root.vault.exists(), "nothing was set up");
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// A vault from when 4 characters were enough opens with its PIN, then
+	/// goes no further until a long enough one replaces it.
+	#[test]
+	fn short_pin_opens_then_is_replaced() {
+		let (mut root, dir) = new_root("renew");
+		let mut store = Store::in_memory().unwrap();
+		store.set_value("kept", "yes").unwrap();
+		root.vault.write(&Key::for_tests(), &store.to_bytes().unwrap()).unwrap();
+		type_pins(&mut root, "test", "");
+		root.submit();
+		settle(&mut root);
+		assert!(matches!(root.state, State::Renew(..)), "a new PIN is asked for");
+		type_pins(&mut root, "tests", "tests");
+		root.submit();
+		assert_eq!(error(&root).as_deref(), Some("Use at least 6 characters."));
+		type_pins(&mut root, "tested1", "tested1");
+		root.submit();
+		settle(&mut root);
+		let State::Open(app) = &mut root.state else {
+			panic!("the app didn't open");
+		};
+		app.shutdown();
+		assert!(matches!(root.vault.unlock("test"), Err(VaultError::WrongPin)), "the old PIN still opens it");
+		let (_, bytes) = root.vault.unlock("tested1").unwrap();
+		assert_eq!(Store::from_bytes(&bytes).unwrap().value("kept").unwrap().as_deref(), Some("yes"));
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
 }

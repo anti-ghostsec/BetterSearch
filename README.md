@@ -244,10 +244,12 @@ are only ever in memory.
 - The key comes from your PIN with **Argon2id** (192 MiB, 3 passes, about a
   second per try); the data is sealed with **XChaCha20-Poly1305**, header
   included, so a wrong PIN or a changed byte is refused.
-- **A 4-digit PIN is a lock on the door, not a safe.** It stops someone using
-  your computer, but someone who copies `vault.bin` can try all 10,000 PINs
-  offline in hours (less with a fast machine). Use 6+ digits or a passphrase
-  if that matters; change it any time in ⚙ Settings.
+- **PINs are at least 6 characters.** Each guess costs someone who copies
+  `vault.bin` about a second of one processor core, so every 4-digit PIN fell
+  in about 3 hours; every 6-digit one takes about 12 days (less with many
+  cores). A few words, or a longer mix of letters and digits, holds out for
+  years. A vault set up when 4 was enough still opens with its PIN, then asks
+  for a new one before anything else. Change it any time in ⚙ Settings.
 - **There's no recovery.** Forget the PIN and the only way on is "Erase and
   start over" on the PIN screen.
 - ⚙ Settings has **Lock now** and **Clear search history**. Deleting (a saved
@@ -256,6 +258,13 @@ are only ever in memory.
 - Data from before the vault (`bettersearch.db`, `settings.json`) is moved in
   on first run and the plain files are deleted once the vault reads back.
   Deleting doesn't scrub the disk, so old copies may linger in free space.
+- **Locking clears the database from memory.** SQLite's memory (the database
+  itself, its page cache, the copies made for saving) is zeroed as it's freed,
+  and so is every decrypted or serialized copy of the vault, so locking or
+  quitting doesn't leave it in freed memory for something else to read.
+  SQLite's working space (sorting, compacting) stays in memory, never in
+  temporary files. What the window is showing (posts, tags, text you typed) is
+  ordinary memory and isn't wiped.
 - While unlocked, the data is in the app's memory like any open document; the
   system could page it to swap.
 
@@ -278,6 +287,7 @@ crates/core   bettersearch-core: no GUI, reusable
   multi.rs      several sites together: takes turns, drops repeats by MD5
   sites/        one adapter per API family: e621/e926, Danbooru 2, Gelbooru 0.2 (Safebooru, gelbooru.com)
   taggraph/     tags, votes, links, aliases (Rust port of taggraph/)
+  wipe.rs       SQLite's memory, zeroed as it's freed
   store.rs      the SQLite database: graph, post cache, history, groups, relations,
                 favorites, saved searches, the relation index
   learn.rs      learns relations from how tags appear together
@@ -298,7 +308,7 @@ that job here). Tag names use booru form (`long_hair`, not `long hair`).
 Votes still record who made them, so a shared graph could sync later.
 
 ```bash
-cargo test --workspace                     # 78 tests (61 core + 17 app); two use ffmpeg if installed, one live test is --ignored
+cargo test --workspace                     # 82 tests (63 core + 19 app); two use ffmpeg if installed, one live test is --ignored
 cargo run -p bettersearch-core --example live -- "fox (smile | grin) -sketch"   # live, against e926
 cargo run -p bettersearch-core --example live -- "fox_ears (smile | blush)" safebooru
 cargo run -p bettersearch-core --example live -- "fox_ears smile -hat" danbooru

@@ -12,20 +12,32 @@ use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::rand_core::RngCore;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{AeadCore, AeadInPlace, KeyInit, OsRng};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 4] = b"BSV1";
 const SALT: usize = 16;
 const NONCE: usize = 24;
+const TAG: usize = 16;
 /// Bytes of header the seal covers: magic, cost settings and salt.
 const SEALED_HEADER: usize = 4 + 12 + SALT;
 /// Argon2id: 192 MiB, 3 passes. About a second on a desktop, per guess.
+#[cfg(not(test))]
 const M_COST: u32 = 192 * 1024;
+#[cfg(not(test))]
 const T_COST: u32 = 3;
+/// Tests make real keys with tiny costs, so a run doesn't take minutes.
+#[cfg(test)]
+const M_COST: u32 = 64;
+#[cfg(test)]
+const T_COST: u32 = 1;
 const LANES: u32 = 1;
-pub const MIN_PIN: usize = 4;
+/// Shortest PIN that can be chosen. At a second a guess, someone with a copy
+/// of the vault gets through every 4-digit PIN in about 3 hours on one core,
+/// every 6-digit one in about 12 days (less with more cores). Vaults from when
+/// 4 was the least still open with their PIN, then ask for a new one.
+pub const MIN_PIN: usize = 6;
 
 #[derive(Debug)]
 pub enum VaultError {
@@ -112,7 +124,7 @@ impl Vault {
 	/// Opens the vault with a PIN: the key (to save with later) and the data.
 	pub fn unlock(&self, pin: &str) -> Result<(Key, Zeroizing<Vec<u8>>), VaultError> {
 		let file = std::fs::read(&self.path)?;
-		if file.len() < SEALED_HEADER + NONCE + 16 || &file[..4] != MAGIC {
+		if file.len() < SEALED_HEADER + NONCE + TAG || &file[..4] != MAGIC {
 			return Err(VaultError::Damaged("not a BetterSearch vault".into()));
 		}
 		let num = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
@@ -124,19 +136,22 @@ impl Vault {
 		let salt: [u8; SALT] = file[16..SEALED_HEADER].try_into().unwrap();
 		let key = Key::derive(pin, m, t, p, salt)?;
 		let nonce = XNonce::from_slice(&file[SEALED_HEADER..SEALED_HEADER + NONCE]);
-		let plain = key
-			.cipher()
-			.decrypt(nonce, Payload { msg: &file[SEALED_HEADER + NONCE..], aad: &key.header })
-			.map_err(|_| VaultError::WrongPin)?;
-		Ok((key, Zeroizing::new(plain)))
+		// Opened in place, in a buffer wiped when dropped: the data is never
+		// in memory unsealed anywhere else.
+		let mut plain = Zeroizing::new(file[SEALED_HEADER + NONCE..].to_vec());
+		key.cipher().decrypt_in_place(nonce, &key.header, &mut *plain).map_err(|_| VaultError::WrongPin)?;
+		Ok((key, plain))
 	}
 
 	/// Seals `plain` with `key` and replaces the file, so a crash mid-write
 	/// leaves the old one whole.
 	pub fn write(&self, key: &Key, plain: &[u8]) -> Result<(), VaultError> {
 		let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-		let sealed =
-			key.cipher().encrypt(&nonce, Payload { msg: plain, aad: &key.header }).map_err(|e| VaultError::Damaged(e.to_string()))?;
+		// Sealed in place, with room for the tag so the buffer never moves,
+		// and wiped when dropped in case sealing fails halfway.
+		let mut sealed = Zeroizing::new(Vec::with_capacity(plain.len() + TAG));
+		sealed.extend_from_slice(plain);
+		key.cipher().encrypt_in_place(&nonce, &key.header, &mut *sealed).map_err(|e| VaultError::Damaged(e.to_string()))?;
 		let tmp = self.path.with_extension("tmp");
 		{
 			let mut f = open_private(&tmp)?;
