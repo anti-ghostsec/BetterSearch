@@ -1787,7 +1787,8 @@ impl App {
 		let mut open = self.settings_open;
 		let mut changed = false;
 		let (mut lock, mut clear_history, mut change_pin, mut check_logins) = (false, false, false, false);
-		egui::Window::new("Settings").open(&mut open).resizable(false).show(ctx, |ui| {
+		egui::Window::new("Settings").open(&mut open).resizable(true).default_height(640.0).max_height(720.0).show(ctx, |ui| {
+			egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
 			ui.label("Your name or e621 username, sent in the User-Agent as the site asks:");
 			changed |= ui.text_edit_singleline(&mut self.settings.contact).changed();
 			ui.add_space(8.0);
@@ -2186,6 +2187,7 @@ impl App {
 			if let Some(n) = &self.pin_note {
 				ui.label(RichText::new(n).weak());
 			}
+			});
 		});
 		if lock {
 			self.lock_requested = true;
