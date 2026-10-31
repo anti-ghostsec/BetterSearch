@@ -1,0 +1,8 @@
+/target/
+# App data lives in ~/.local/share/bettersearch, never here; just in case:
+*.db
+*.db-wal
+*.db-shm
+vault.bin
+vault.tmp
+settings.json

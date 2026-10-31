@@ -1,0 +1,320 @@
+# BetterSearch
+
+A desktop booru search with real boolean searches and **links**: named
+groups of tags on a post (`relation: rabbit · eat · carrot`) that you can
+search for. Written in Rust; the window is [egui](https://github.com/emilk/egui).
+
+```bash
+cargo run --release -p bettersearch
+```
+
+It starts on **e926** (e621's safe-only site) with only *Safe* ticked. Pick
+the sites and ratings from the two menus in the top bar. Add your name or e621 username in ⚙
+Settings; e621 asks every app to say who runs it.
+
+| Site | Account |
+| --- | --- |
+| e926, e621 | optional (API key) |
+| Danbooru | optional: without one, searches take 2 tags (Gold 6, Platinum 12) |
+| Safebooru | not needed |
+| Gelbooru | required: user id and API key from its account options page; its images still can't be shown here (see below) |
+
+On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
+`safe`), and `sensitive` counts as *Questionable*. Danbooru's 2-tag limit
+doesn't count rating, score, size, date, id or md5, so those always go to the
+site; other tags are sent rarest first and the rest are checked here.
+Gelbooru-style sites have no alias API and no tag categories in post answers,
+so their tags all show as general.
+
+## Searching
+
+| Write | Finds |
+| --- | --- |
+| `fox wolf` | both tags |
+| `-sketch` | not this tag |
+| `fox \| wolf` or `~fox ~wolf` | either |
+| `(fox \| wolf) -(sketch \| comic)` | groups, nested as deep as you like |
+| `fox*` | wildcard |
+| `score:>100 rating:s order:score` | metatags |
+| `[eat]` | posts where `eat` is in a link with other tags |
+| `relation[rabbit eat]` | a `relation` link holding both |
+| `@animal` | any tag in your group `animal` |
+| `-@fat` | none of the tags in your group `fat` (sent to the site as `-a -b …`) |
+| `favorited:yes` | your favorites (kept on this computer) |
+| `rabbit eat relation` | rabbits eating what the relation index says rabbits eat |
+| `@animal eat relation` | each animal in the group eating its own things |
+
+Sites only take a flat list of tags with limits, so each search is **planned**
+(open "How this search runs" to see the plan):
+
+- Tags the site can take are sent to it, **rarest first** when there are more
+  than its limit (e621: 40). The rest are checked here as posts load.
+- One OR of plain tags goes as `~a ~b`. A bigger OR, like
+  `(fox smile) | (wolf -sketch)`, runs as **one search per side, merged newest
+  first**, with repeats dropped.
+- **Old tag names** are looked up and swapped for the site's current ones,
+  so the local check doesn't throw away posts the site found under the new name.
+- Every post that comes back is checked against the **whole** search, so the
+  results are exact whatever the site could take.
+- A link's tags go to the site like plain tags (they're all on its post), and
+  the link itself is checked here. Posts saved on this computer are checked
+  first. A search with nothing to send the site (only `-links`) runs on saved
+  posts alone.
+
+## Saved searches
+
+**☆ Save** next to Search keeps the search with its sites and ratings, under a
+name. They're listed at the top of the tags panel: click one to run it, ✕
+then **Delete** to remove it. Each remembers the newest post it showed on
+every site, so the next run marks posts that came in since with **NEW** and
+counts them under the results.
+
+Saved searches live in the encrypted vault like everything else. Deleting one
+removes it and its query from your search history, and the database runs with
+secure delete on, so deleted rows are overwritten rather than left in free
+space; the next save writes a vault without them.
+
+## Several sites at once
+
+Tick more than one site in the site menu and a search runs on all of them.
+Results take turns between the sites, and a file that turns up on two sites
+(same MD5; Safebooru copies a lot of Danbooru) shows once.
+
+Sites name things differently, so searches are written in **your** words and
+**tag translations** say what to search on each site instead. Open them from
+the site menu, or right-click a tag on a post → "Translate for other sites…".
+
+| Your tag | Site | Search as |
+| --- | --- | --- |
+| `girl` | e926 | `female` |
+| `girl` | Danbooru | `1girl \| 2girls` |
+| `sketch` | Danbooru | *(empty: not on this site, left out there)* |
+
+A translation can be any search without links. When several sites are picked,
+the app also checks each tag's post count per site and says which tags a site
+doesn't have, so you know where a translation is needed. Site aliases still
+apply after translating (e621 turns `wolf_ears` into `ears` on its own).
+
+## Browsing
+
+- **Keys** (when you're not typing in a box): ← → move between posts, ↑ ↓ a
+  row, Enter shows the selected post large, Esc goes back, F favorites, Z
+  switches the large view between fit and full size.
+- **Large view**: double-click a thumbnail (or Enter, or "View large"). ◀ ▶
+  go through the results and load more at the end; "Original" shows the full
+  file instead of the site's sample.
+- **GIFs and videos play in the large view.** GIFs are decoded here, every
+  frame. Videos (webm, mp4) are downloaded into memory, put in a RAM-only file
+  that never touches the disk, and decoded by `ffmpeg` into frames the app
+  draws, with sound (PulseAudio if running, else ALSA). Space pauses, M mutes,
+  the bar seeks; videos loop. ffmpeg may only read that one file
+  (`-protocol_whitelist file`), so a crafted video can't make it fetch
+  anything. Needs `ffmpeg` installed; without it, "Open file" plays elsewhere.
+- **Tags in the post panel**: click to add one to the search, click again to
+  take it out; − leaves it out. ✓ and ⊘ show what the search does with it.
+- **Find similar** (post panel): posts sharing the most *telling* tags with
+  this one. Rare tags count for more than everyday ones, and the post's
+  species or character is required, so a dog playing guitar finds dogs
+  (playing guitar, or dressed alike), not anyone in a plaid shirt.
+  **Other versions** asks e621's picture search for edits, crops and reposts
+  of the same picture (e621/e926 only; Danbooru's needs an account).
+  "Back to search" returns to your search.
+
+## Favorites
+
+♥ in the post panel (or F, or right-click a thumbnail) keeps a post in your
+favorites: in the encrypted vault, no account needed, with a copy of the post
+so it's there offline. ♥ next to Search shows them from every site;
+`favorited:yes fox` searches within them and `favorited:no` leaves them out.
+The site is never told.
+
+## The tags panel
+
+The panel on the left (☰ Tags) shows:
+
+- **In your search**: your tags as chips. Click one to flip it from wanted
+  (✓) to excluded (⊘) to gone.
+- **In these posts**: every tag on what's loaded, with a bar for how many
+  posts have it. Click to search with it, − to exclude it. **Hover a tag** and
+  the posts without it dim.
+- **Your groups**, **links in these posts**, **your usual tags** (from your
+  history) and **recent searches**.
+
+## Relations: `rabbit eat relation`
+
+- `rabbit eat` is plain tags: a rabbit eating anything, a steak included.
+- `rabbit eat relation` (also `rabbit relation eat`, `link` or `@relation` in
+  place of `relation`) uses the **relation index**: rabbits eating what
+  rabbits eat, searched as `rabbit eating ~carrot ~vegetable …`.
+- `@animal eat relation` pairs each animal in your group with *its own*
+  things: dogs with what dogs eat, rabbits with carrots, never rabbits with
+  bones.
+
+**The index fills itself.** The first time you ask about a subject and verb,
+the app learns from how tags appear together on the site (e621/e926 by
+sampling random posts, Danbooru from its whole-site counts; ~15 s, once).
+A good answer is tied to *both*: carrot comes with rabbit far more than with
+posts in general, and comes with eating, directly or through the verb's big
+companions (eating → food). Rabbit ears are tied only to rabbit, plates only
+to eating; carrot is tied to both. The verb is looked up as the site tags it
+(`eat` → `eating`, `ride` → `riding`).
+
+Ties are judged cautiously (from the low end of what a sample could mean),
+tags on 1% or more of the site are skipped as too broad, and when the verb
+has bridges an answer must come with one (eaten things come with food; a
+character's sweater seen at a few meals doesn't). On e926 that learns
+rabbit + eat → vegetable, carrot; horse + eat → apple, muffin; a stray tag
+or two still gets through. Dogs and cats learn little there: their eating
+posts don't share a clear food in a 640-post sample. So: often right,
+sometimes a stray, sometimes nothing. In the tags panel each
+one has ✓ keep and ✕ reject; rejected ones are never used or learned again,
+and relations you set up yourself count as kept. Groups & relations lists the
+whole index with **Learn again**.
+
+## Links, groups and relations
+
+A **link** says how tags on a post go together: select a post, tick two or
+more of its tags, pick a link name and press **Link** (`relation: rabbit ·
+eat · carrot`). Add your own tags to a post in "Your tags"; they count in
+searches like site tags.
+
+**Links fill themselves in.** Once you've made a link, every post with the
+same tags gets it too, marked *filled in*, with ✓ to keep it or ✕ to say "not
+on this post" (it won't come back there). Turn this off in ⚙ Settings to get
+the links offered with a + instead.
+
+**Groups** name a set of tags and **relations** say how tags go together
+everywhere, not just on one post. Open *Groups & relations* from the tags
+panel, or right-click a tag → "Add to a group…":
+
+| Set up | |
+| --- | --- |
+| group `animal` | dog, rabbit |
+| group `object` | bone, carrot |
+| relation | rabbit —eat→ carrot, dog —eat→ bone |
+
+| Search | Finds |
+| --- | --- |
+
+| `@animal smile` | any animal, smiling (sent to the site as `~dog ~rabbit smile`) |
+| `eat[@animal @object]`, `eat[rabbit]` | posts with a link (made by you or filled in) between them |
+
+`link` and `relation` only ask with a subject and verb around them, so
+`link zelda` is still the tag.
+
+Under the hood the search becomes the links your relations allow
+(`rabbit eat` → `eat[carrot rabbit] | eat[lettuce rabbit]`; open "How this
+search runs" to see it). Pairs nothing relates are dropped, so the site is
+only asked about real pairs, one search each, merged newest first. Relations
+fill in under the site's own names too: e621 calls `dog` `domestic_dog`, and
+dog —holding→ guitar still fills in on those posts. Posts saved here merge in
+by age, so links using tags of your own still work.
+
+A relation says the tags go together; it can't see the picture. `rabbit eat`
+finds rabbits with carrots. To insist on the act, add the site's tag:
+`rabbit eat eating`.
+
+## Posts without images
+
+e621 leaves the images out, for people who aren't logged in, on posts with
+tags from its default blacklist (about one in eight explicit posts). Those
+are skipped in the grid and counted under it; ⚙ Settings can show them
+anyway. With your e621 username and API key in Settings, e621 sends them;
+**Check logins** there asks each site whether it accepts your login. With an
+API key but no login name, the name at the top of Settings is used.
+
+**Gelbooru's images.** gelbooru.com's image servers only serve its own
+website: an app asking for an image gets sent to a "hotlink" page instead,
+API key or not. Searching works; the pictures don't, so Gelbooru tiles say so
+and "Open page" shows the post in your browser. The app doesn't pretend to be
+gelbooru.com to get around that. Most Gelbooru posts are copies from
+Danbooru: with both ticked, the same file shows once, and the copy whose
+image can be shown is kept.
+
+## Privacy: the vault
+
+Everything the app keeps (settings and logins, search history, links,
+groups, translations and the posts you've seen) lives in one encrypted file,
+`~/.local/share/bettersearch/vault.bin`. On start the app asks for your PIN,
+decrypts the file **into memory only**, and works on it there; it writes an
+encrypted copy back a second after your own changes, every 30 seconds while
+posts load, and on lock or exit. Nothing is written in the clear. Thumbnails
+are only ever in memory.
+
+- The key comes from your PIN with **Argon2id** (192 MiB, 3 passes, about a
+  second per try); the data is sealed with **XChaCha20-Poly1305**, header
+  included, so a wrong PIN or a changed byte is refused.
+- **A 4-digit PIN is a lock on the door, not a safe.** It stops someone using
+  your computer, but someone who copies `vault.bin` can try all 10,000 PINs
+  offline in hours (less with a fast machine). Use 6+ digits or a passphrase
+  if that matters; change it any time in ⚙ Settings.
+- **There's no recovery.** Forget the PIN and the only way on is "Erase and
+  start over" on the PIN screen.
+- ⚙ Settings has **Lock now** and **Clear search history**. Deleting (a saved
+  search, history, a link) overwrites the data inside the database, and each
+  unlock compacts it, so nothing deleted is carried into the next vault.
+- Data from before the vault (`bettersearch.db`, `settings.json`) is moved in
+  on first run and the plain files are deleted once the vault reads back.
+  Deleting doesn't scrub the disk, so old copies may linger in free space.
+- While unlocked, the data is in the app's memory like any open document; the
+  system could page it to swap.
+
+What leaves the computer: searches, autocomplete words and image requests go
+to the sites you tick, over https. Your name (from Settings) goes only to
+e621/e926, which ask for it in the User-Agent; other sites get the app's name
+alone. Logins go to their own site only (e621 and Danbooru in the request
+header; Gelbooru's API wants them in the address, so network errors are shown
+without addresses). Downloads are https-only, refuse redirects to plain http,
+and stop at 400 MB. Links opened in the browser must be web links. Nothing
+else is sent anywhere.
+
+## Layout
+
+```
+crates/core   bettersearch-core: no GUI, reusable
+  query.rs      the search language: parser, evaluator
+  plan.rs       turns a search into site queries plus a local check
+  search.rs     runs a plan on one site: translations, aliases, paging, filtering
+  multi.rs      several sites together: takes turns, drops repeats by MD5
+  sites/        one adapter per API family: e621/e926, Danbooru 2, Gelbooru 0.2 (Safebooru, gelbooru.com)
+  taggraph/     tags, votes, links, aliases (Rust port of taggraph/)
+  store.rs      the SQLite database: graph, post cache, history, groups, relations,
+                favorites, saved searches, the relation index
+  learn.rs      learns relations from how tags appear together
+  similar.rs    posts sharing a post's most telling tags
+crates/app    bettersearch: the egui window
+  lock.rs       PIN screen and the saver
+  vault.rs      the encrypted file (Argon2id + XChaCha20-Poly1305)
+  media.rs      GIF and video playback (ffmpeg, from memory)
+  tags_panel.rs the tags panel
+  groups.rs     the Groups & relations window
+taggraph/     the original TypeScript module from the website
+```
+
+`taggraph/` is the module from the website, kept for reference. The Rust port
+keeps its schema, aliases, rename/merge and link votes, and drops what only a
+public site needs (rate limits, blocking, adult flags; the rating filter does
+that job here). Tag names use booru form (`long_hair`, not `long hair`).
+Votes still record who made them, so a shared graph could sync later.
+
+```bash
+cargo test --workspace                     # 78 tests (61 core + 17 app); two use ffmpeg if installed, one live test is --ignored
+cargo run -p bettersearch-core --example live -- "fox (smile | grin) -sketch"   # live, against e926
+cargo run -p bettersearch-core --example live -- "fox_ears (smile | blush)" safebooru
+cargo run -p bettersearch-core --example live -- "fox_ears smile -hat" danbooru
+TRANSLATE="e926:fox_ears=fox" cargo run -p bettersearch-core --example live -- "fox_ears smile" e926,safebooru,danbooru
+cargo run -p bettersearch-core --example live -- "rabbit eat relation"   # learns, prints the index
+SIMILAR=6819203 cargo run -p bettersearch-core --example live -- x          # posts like #6819203
+TAG_GROUPS="animal:fox,wolf;object:sword,guitar" RELATIONS="holding:fox,sword;holding:wolf,guitar" \
+  cargo run -p bettersearch-core --example live -- "@animal holding @object"
+```
+
+## Adding a site
+
+Implement `sites::Site` (search with a cursor, tag counts, aliases,
+autocomplete, image fetch) and say what its search box can take in
+`Capabilities` (including metatags that don't count toward its tag limit). The planner and the window need nothing else. Next up:
+
+- Moebooru (Konachan, yande.re), more Danbooru and Gelbooru 0.2 sites
+- blacklists with conditions
+- thumbnails cached on disk (encrypted, like everything else)
