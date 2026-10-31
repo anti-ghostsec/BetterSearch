@@ -12,6 +12,9 @@ pub struct Settings {
 	/// Optional e621 login: username and an API key from the account settings page.
 	pub e621_user: String,
 	pub e621_key: String,
+	/// Optional e6ai login; it's an e621 fork with its own accounts.
+	pub e6ai_user: String,
+	pub e6ai_key: String,
 	/// Danbooru login: account name and an API key from its profile page.
 	/// Raises the 2-tag search limit for Gold accounts and up.
 	pub danbooru_user: String,
@@ -37,6 +40,47 @@ pub struct Settings {
 	pub taste: Taste,
 	/// The local API other programs can search through. Off until switched on.
 	pub api: Api,
+	/// Boorus you added yourself.
+	pub custom_sites: Vec<CustomSite>,
+}
+
+/// Which API a site speaks, so the right adapter is built for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Family {
+	/// Gelbooru 0.2 (`index.php?page=dapi`): most small and large boorus.
+	#[default]
+	Gelbooru,
+	/// Danbooru 2 (`posts.json`).
+	Danbooru,
+	/// e621 and its forks.
+	E621,
+	/// Moebooru (`post.json`): yande.re, konachan and friends.
+	Moebooru,
+}
+
+impl Family {
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::Gelbooru => "Gelbooru 0.2",
+			Self::Danbooru => "Danbooru 2",
+			Self::E621 => "e621",
+			Self::Moebooru => "Moebooru",
+		}
+	}
+}
+
+/// A booru the user added. `id` is a slug used in saved searches and tags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomSite {
+	pub id: String,
+	pub name: String,
+	pub base: String,
+	pub family: Family,
+	#[serde(default)]
+	pub user: String,
+	#[serde(default)]
+	pub key: String,
 }
 
 /// Where the model calls go.
@@ -112,6 +156,8 @@ impl Default for Settings {
 			contact: String::new(),
 			e621_user: String::new(),
 			e621_key: String::new(),
+			e6ai_user: String::new(),
+			e6ai_key: String::new(),
 			danbooru_user: String::new(),
 			danbooru_key: String::new(),
 			gelbooru_user: String::new(),
@@ -125,6 +171,7 @@ impl Default for Settings {
 			show_imageless: false,
 			taste: Taste::default(),
 			api: Api::default(),
+			custom_sites: Vec::new(),
 		}
 	}
 }
@@ -157,8 +204,32 @@ impl Settings {
 		if !s.site.is_empty() && !s.sites.contains(&s.site) {
 			s.sites = vec![std::mem::take(&mut s.site)];
 		}
+		s.custom_sites = clean_custom(std::mem::take(&mut s.custom_sites));
 		s
 	}
+}
+
+/// Keeps only usable custom sites: https, a host, a unique slug.
+pub fn clean_custom(list: Vec<CustomSite>) -> Vec<CustomSite> {
+	let mut seen = std::collections::HashSet::new();
+	list.into_iter()
+		.filter_map(|mut c| {
+			let base = c.base.trim().trim_end_matches('/').to_string();
+			let host = base.strip_prefix("https://")?.split('/').next()?.to_lowercase();
+			if host.is_empty() || host.contains(' ') {
+				return None;
+			}
+			c.base = base;
+			if c.id.trim().is_empty() {
+				c.id = host.replace('.', "_");
+			}
+			c.id = c.id.trim().to_lowercase().replace(' ', "_");
+			if c.name.trim().is_empty() {
+				c.name = host;
+			}
+			seen.insert(c.id.clone()).then_some(c)
+		})
+		.collect()
 }
 
 #[cfg(test)]
@@ -170,6 +241,20 @@ mod tests {
 		assert_eq!(Settings::from_json(r#"{"site":"e621"}"#).sites, vec!["e621"]);
 		assert_eq!(Settings::from_json(r#"{"sites":["e926","danbooru"]}"#).sites, vec!["e926", "danbooru"]);
 		assert_eq!(Settings::from_json("{}").sites, vec!["e926"]);
+	}
+
+	#[test]
+	fn custom_sites_are_cleaned_and_deduped() {
+		let j = r#"{"custom_sites":[
+			{"id":"","name":"","base":"https://Booru.Example/","family":"gelbooru"},
+			{"id":"","name":"","base":"https://booru.example","family":"danbooru"},
+			{"id":"x","name":"X","base":"http://plain.example","family":"gelbooru"}]}"#;
+		let s = Settings::from_json(j);
+		// http is refused; the same host twice is folded into one.
+		assert_eq!(s.custom_sites.len(), 1, "{:?}", s.custom_sites);
+		assert_eq!(s.custom_sites[0].id, "booru_example");
+		assert_eq!(s.custom_sites[0].base, "https://Booru.Example");
+		assert_eq!(s.custom_sites[0].name, "booru.example");
 	}
 
 	#[test]

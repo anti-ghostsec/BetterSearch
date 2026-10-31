@@ -22,7 +22,7 @@ const MAX_COUNTS: usize = 25;
 
 /// Which autocomplete the site has.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Suggest {
+pub enum Suggest {
 	/// `autocomplete.php?q=`, answers `{label: "name (count)", value}`.
 	Labels,
 	/// `index.php?page=autocomplete2`, answers `{value, post_count, category}`.
@@ -66,7 +66,30 @@ impl Gelbooru {
 		Self::new("gelbooru", "Gelbooru", "https://gelbooru.com", user_agent, Suggest::Autocomplete2, true, RATINGS)
 	}
 
-	fn new(
+	/// Another Gelbooru 0.2 site: same API, its own name and address.
+	pub fn custom(id: &str, name: &str, base: &str, user_agent: &str) -> Result<Self> {
+		const RATINGS: &[(&str, Rating)] = &[
+			("general", Rating::Safe),
+			("sensitive", Rating::Questionable),
+			("questionable", Rating::Questionable),
+			("explicit", Rating::Explicit),
+		];
+		Self::new(id, name, base, user_agent, Suggest::Autocomplete2, true, RATINGS)
+	}
+
+	pub fn xbooru(user_agent: &str) -> Result<Self> {
+		Self::custom("xbooru", "xbooru", "https://xbooru.com", user_agent)
+	}
+
+	pub fn tbib(user_agent: &str) -> Result<Self> {
+		Self::custom("tbib", "The Big ImageBoard", "https://tbib.org", user_agent)
+	}
+
+	pub fn hypnohub(user_agent: &str) -> Result<Self> {
+		Self::custom("hypnohub", "Hypnohub", "https://hypnohub.net", user_agent)
+	}
+
+	pub fn new(
 		id: &str,
 		name: &str,
 		base: &str,

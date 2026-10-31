@@ -42,6 +42,11 @@ impl E621 {
 		Ok(site)
 	}
 
+	/// An e621 fork for AI-made art. Same API, own login.
+	pub fn e6ai(user_agent: &str) -> Result<Self> {
+		Self::new("e6ai", "e6ai (AI art)", "https://e6ai.net", user_agent)
+	}
+
 	pub fn new(id: &str, name: &str, base: &str, user_agent: &str) -> Result<Self> {
 		let client = Client::builder().user_agent(user_agent).timeout(Duration::from_secs(30)).build()?;
 		Ok(E621 {

@@ -18,6 +18,22 @@ Settings; e621 asks every app to say who runs it.
 | Danbooru | optional: without one, searches take 2 tags (Gold 6, Platinum 12) |
 | Safebooru | not needed |
 | Gelbooru | required: user id and API key from its account options page |
+| e6ai | optional (its own account; e621's API) |
+| aibooru | optional (Danbooru's API) |
+| xbooru, TBIB, Hypnohub | not needed |
+| yande.re, Konachan, Konachan.net, Sakugabooru | not needed (Moebooru) |
+
+All of those are off until ticked in the site menu, and every one can be mixed
+with the others.
+
+**Custom boorus** (⚙ Settings → Custom boorus) take any site speaking one of
+those four APIs: the address, a name, and the API family. https only, and the
+address is the site root, not a page. They're searched like the built-ins and
+can be removed again. Logins are optional and only for sites that need one.
+
+Rule34.xxx, furry.booru.org and safebooru.donmai.us currently answer
+Cloudflare's challenge to plain clients, so they can't be added until a way
+past that exists. Paheal answers HTML rather than its API.
 
 On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
 `safe`), and `sensitive` counts as *Questionable*. Danbooru's 2-tag limit

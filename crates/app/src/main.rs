@@ -16,7 +16,7 @@ mod worker;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use bettersearch_core::sites::{Danbooru, E621, Gelbooru, user_agent};
+use bettersearch_core::sites::{Danbooru, E621, Gelbooru, Moebooru, user_agent};
 use bettersearch_core::store::RelationState;
 use bettersearch_core::taggraph::{ItemLink, ItemTag, LinkSuggestion};
 use bettersearch_core::{Post, Rating, Site, Store, TagSuggestion};
@@ -25,7 +25,7 @@ use zeroize::Zeroize;
 
 use groups::Groups;
 use lock::{Root, Saver};
-use settings::Settings;
+use settings::{CustomSite, Family, Settings};
 use tags_panel::TagsPanel;
 use translations::Translations;
 use worker::{Job, Msg, Worker};
@@ -139,12 +139,24 @@ enum Action {
 	Translate(String),
 }
 
+#[derive(Default)]
+struct SiteForm {
+	open: bool,
+	base: String,
+	name: String,
+	family: Option<Family>,
+	user: String,
+	key: String,
+	note: Option<String>,
+}
+
 struct App {
 	settings: Settings,
 	settings_open: bool,
 	translations: Translations,
 	groups: Groups,
 	sites: Vec<Arc<dyn Site>>,
+	site_form: SiteForm,
 	store: Arc<Mutex<Store>>,
 	worker: Worker,
 	query: String,
@@ -214,20 +226,39 @@ fn make_sites(s: &Settings) -> Vec<Arc<dyn Site>> {
 	let mut out: Vec<Arc<dyn Site>> = Vec::new();
 	// With an API key but no login name, the name at the top of Settings is the e621 username.
 	let e621_user = if s.e621_user.trim().is_empty() { &s.contact } else { &s.e621_user };
-	if let Ok(site) = E621::e926(&ua) {
-		out.push(Arc::new(site.with_login(e621_user, &s.e621_key)));
-	}
-	if let Ok(site) = E621::e621(&ua) {
-		out.push(Arc::new(site.with_login(e621_user, &s.e621_key)));
-	}
-	if let Ok(site) = Danbooru::danbooru(&anon) {
-		out.push(Arc::new(site.with_login(&s.danbooru_user, &s.danbooru_key)));
-	}
-	if let Ok(site) = Gelbooru::safebooru(&anon) {
-		out.push(Arc::new(site));
-	}
-	if let Ok(site) = Gelbooru::gelbooru(&anon) {
-		out.push(Arc::new(site.with_login(&s.gelbooru_user, &s.gelbooru_key)));
+	let mut push = |site: Option<Arc<dyn Site>>| {
+		if let Some(site) = site {
+			out.push(site);
+		}
+	};
+	push(E621::e926(&ua).ok().map(|x| Arc::new(x.with_login(e621_user, &s.e621_key)) as Arc<dyn Site>));
+	push(E621::e621(&ua).ok().map(|x| Arc::new(x.with_login(e621_user, &s.e621_key)) as Arc<dyn Site>));
+	push(E621::e6ai(&ua).ok().map(|x| Arc::new(x.with_login(&s.e6ai_user, &s.e6ai_key)) as Arc<dyn Site>));
+	push(Danbooru::danbooru(&anon).ok().map(|x| Arc::new(x.with_login(&s.danbooru_user, &s.danbooru_key)) as Arc<dyn Site>));
+	push(Danbooru::new("aibooru", "aibooru (AI art)", "https://aibooru.online", &anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::safebooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::gelbooru(&anon).ok().map(|x| Arc::new(x.with_login(&s.gelbooru_user, &s.gelbooru_key)) as Arc<dyn Site>));
+	push(Gelbooru::xbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::tbib(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::hypnohub(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::yande_re(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::konachan(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::konachan_net(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Moebooru::sakugabooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	for c in &s.custom_sites {
+		let site: Option<Arc<dyn Site>> = match c.family {
+			Family::Gelbooru => Gelbooru::custom(&c.id, &c.name, &c.base, &anon)
+				.ok()
+				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
+			Family::Danbooru => Danbooru::new(&c.id, &c.name, &c.base, &anon)
+				.ok()
+				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
+			Family::E621 => E621::new(&c.id, &c.name, &c.base, &anon)
+				.ok()
+				.map(|x| Arc::new(x.with_login(&c.user, &c.key)) as Arc<dyn Site>),
+			Family::Moebooru => Moebooru::new(&c.id, &c.name, &c.base, &anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>),
+		};
+		push(site);
 	}
 	out
 }
@@ -258,6 +289,7 @@ impl App {
 		let worker = Worker::spawn(ctx.clone(), store.clone());
 		App {
 			sites: make_sites(&settings),
+			site_form: SiteForm::default(),
 			query: settings.last_search.clone(),
 			settings,
 			settings_open: false,
@@ -1565,6 +1597,105 @@ impl App {
 				ui.label("API key ");
 				changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.gelbooru_key).password(true)).changed();
 			});
+			ui.add_space(8.0);
+			ui.label("Optional e6ai login (e621's API, but its own accounts; AI-made furry art):");
+			ui.horizontal(|ui| {
+				ui.label("Username");
+				changed |= ui.text_edit_singleline(&mut self.settings.e6ai_user).changed();
+			});
+			ui.horizontal(|ui| {
+				ui.label("API key ");
+				changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.e6ai_key).password(true)).changed();
+			});
+			ui.add_space(8.0);
+			ui.separator();
+			ui.strong("Custom boorus");
+			ui.label(
+				RichText::new("Any booru speaking the Gelbooru, Danbooru, e621 or Moebooru API. https only; the address is the site root.")
+					.weak(),
+			);
+			let mut remove: Option<String> = None;
+			for c in &self.settings.custom_sites {
+				ui.horizontal(|ui| {
+					ui.label(format!("{} — {} ({})", c.name, c.base, c.family.label()));
+					if ui.small_button("Remove").clicked() {
+						remove = Some(c.id.clone());
+					}
+				});
+			}
+			if let Some(id) = remove {
+				self.settings.custom_sites.retain(|c| c.id != id);
+				self.settings.sites.retain(|s| s != &id);
+				self.sites = make_sites(&self.settings);
+				self.save_settings();
+			}
+			if ui.button("Add a booru…").clicked() {
+				self.site_form.open = true;
+			}
+			if self.site_form.open {
+				ui.add_space(4.0);
+				ui.horizontal(|ui| {
+					ui.label("Address https://");
+					ui.text_edit_singleline(&mut self.site_form.base);
+				});
+				ui.horizontal(|ui| {
+					ui.label("Name");
+					ui.text_edit_singleline(&mut self.site_form.name);
+				});
+				ui.horizontal(|ui| {
+					ui.label("API");
+					let mut family = self.site_form.family.unwrap_or_default();
+					egui::ComboBox::from_id_salt("site-family").selected_text(family.label()).show_ui(ui, |ui| {
+						for f in [Family::Gelbooru, Family::Danbooru, Family::E621, Family::Moebooru] {
+							ui.selectable_value(&mut family, f, f.label());
+						}
+					});
+					self.site_form.family = Some(family);
+				});
+				ui.horizontal(|ui| {
+					ui.label("Login (optional)");
+					ui.text_edit_singleline(&mut self.site_form.user);
+					ui.add(egui::TextEdit::singleline(&mut self.site_form.key).password(true).hint_text("API key"));
+				});
+				ui.horizontal(|ui| {
+					if ui.button("Add").clicked() {
+						let mut base = std::mem::take(&mut self.site_form.base);
+						base = base.trim().to_string();
+						if !base.starts_with("https://") {
+							base = format!("https://{base}");
+						}
+						let draft = CustomSite {
+							id: String::new(),
+							name: std::mem::take(&mut self.site_form.name),
+							base,
+							family: self.site_form.family.unwrap_or_default(),
+							user: std::mem::take(&mut self.site_form.user),
+							key: std::mem::take(&mut self.site_form.key),
+						};
+						let mut cleaned = settings::clean_custom(vec![draft]);
+						match cleaned.pop() {
+							None => self.site_form.note = Some("That isn't an https address.".into()),
+							Some(c) if self.settings.custom_sites.iter().any(|x| x.id == c.id) => {
+								self.site_form.note = Some(format!("{} is already added.", c.id));
+							}
+							Some(c) => {
+								let id = c.id.clone();
+								self.settings.custom_sites.push(c);
+								self.settings.sites.push(id);
+								self.sites = make_sites(&self.settings);
+								self.save_settings();
+								self.site_form = SiteForm::default();
+							}
+						}
+					}
+					if ui.button("Cancel").clicked() {
+						self.site_form = SiteForm::default();
+					}
+				});
+				if let Some(n) = &self.site_form.note {
+					ui.colored_label(Color32::from_rgb(220, 90, 90), n);
+				}
+			}
 			ui.add_space(4.0);
 			if ui.button("Check logins").on_hover_text("Ask each site whether it accepts the login above").clicked() {
 				check_logins = true;
@@ -1841,7 +1972,8 @@ mod tests {
 			for _ in 0..3 {
 				seen = texts(&mut app, &ctx, width);
 			}
-			for want in ["⚙", "Safe", "☆ Save", "Search", "5 sites"] {
+			let many = format!("{} sites", app.sites.len());
+			for want in ["⚙", "Safe", "☆ Save", "Search", many.as_str()] {
 				let Some((_, rect)) = seen.iter().find(|(t, _)| t == want) else {
 					panic!("“{want}” not drawn at width {width}: {:?}", seen.iter().map(|(t, _)| t).collect::<Vec<_>>())
 				};
