@@ -234,6 +234,23 @@ pub fn data_dir() -> PathBuf {
 }
 
 impl Settings {
+	/// Wipes the secrets still in memory when the app closes: keys, tokens and
+	/// the login fields. Everything else dies with the process.
+	pub fn wipe(&mut self) {
+		use zeroize::Zeroize;
+		for field in [
+			&mut self.e621_key,
+			&mut self.e6ai_key,
+			&mut self.danbooru_key,
+			&mut self.gelbooru_key,
+			&mut self.taste.api_key,
+			&mut self.api.token,
+			&mut self.last_search,
+		] {
+			field.zeroize();
+		}
+	}
+
 	/// The plain-text settings file from before the vault, if it's still around.
 	pub fn legacy_path() -> PathBuf {
 		data_dir().join("settings.json")
@@ -285,7 +302,7 @@ pub fn clean_custom(list: Vec<CustomSite>) -> Vec<CustomSite> {
 
 #[cfg(test)]
 mod tests {
-	use super::Settings;
+	use super::{Api, Settings, Taste};
 
 	#[test]
 	fn reads_old_single_site_files() {
@@ -306,6 +323,19 @@ mod tests {
 		assert_eq!(s.custom_sites[0].id, "booru_example");
 		assert_eq!(s.custom_sites[0].base, "https://Booru.Example");
 		assert_eq!(s.custom_sites[0].name, "booru.example");
+	}
+
+	#[test]
+	fn wiping_clears_the_secrets() {
+		let mut s = Settings {
+			e621_key: "k1".into(),
+			gelbooru_key: "k2".into(),
+			taste: Taste { api_key: "k3".into(), ..Default::default() },
+			api: Api { token: "t".into(), ..Default::default() },
+			..Default::default()
+		};
+		s.wipe();
+		assert_eq!((s.e621_key.len(), s.gelbooru_key.len(), s.taste.api_key.len(), s.api.token.len()), (0, 0, 0, 0));
 	}
 
 	#[test]

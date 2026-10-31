@@ -429,6 +429,12 @@ impl App {
 		self.server = None;
 		self.save_settings();
 		self.saver.flush(&self.store);
+		// Live copies of keys and tokens, the vault key and the cookie jar are
+		// all wiped; the database's own memory is zeroed as SQLite frees it.
+		self.settings.wipe();
+		self.taste_brief.zeroize();
+		self.query.zeroize();
+		self.cookie_text.zeroize();
 	}
 
 	/// The sites ticked, in menu order; the first if none are.

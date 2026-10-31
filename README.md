@@ -334,6 +334,11 @@ are only ever in memory.
 - Data from before the vault (`bettersearch.db`, `settings.json`) is moved in
   on first run and the plain files are deleted once the vault reads back.
   Deleting doesn't scrub the disk, so old copies may linger in free space.
+- **Closing wipes what's readable.** The vault key, logins, API keys, the token
+  and the cookie jar are zeroed on the way out, and SQLite's own memory is
+  zeroed as it's freed. Post text and thumbnails are simply dropped; the
+  kernel clears pages before another program gets them, but swap keeps copies
+  until it is reused, so a hibernate still writes RAM to disk.
 - **Locking clears the database from memory.** SQLite's memory (the database
   itself, its page cache, the copies made for saving) is zeroed as it's freed,
   and so is every decrypted or serialized copy of the vault, so locking or
