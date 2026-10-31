@@ -31,6 +31,9 @@ those four APIs: the address, a name, and the API family. https only, and the
 address is the site root, not a page. They're searched like the built-ins and
 can be removed again. Logins are optional and only for sites that need one.
 
+`tools/probe-site.sh <host>` says in a few seconds whether a site is addable
+and which family to pick, without changing anything.
+
 Rule34.xxx, furry.booru.org and safebooru.donmai.us currently
 answer an interactive challenge to plain clients, so they can't be added until
 a cookie import exists. Paheal answers HTML rather than its API.
