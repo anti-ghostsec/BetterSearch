@@ -94,6 +94,11 @@ impl MultiSearch {
 		self.searches.iter().find(|s| s.site().id() == site).is_none_or(|s| s.site().shows_images())
 	}
 
+	/// Where a site sits in the list, for keeping the preferred copy of a repeat.
+	fn site_rank(&self, site: &str) -> usize {
+		self.searches.iter().position(|s| s.site().id() == site).unwrap_or(usize::MAX)
+	}
+
 	pub fn done(&self) -> bool {
 		self.searches.iter().all(Search::done)
 	}
@@ -146,12 +151,18 @@ impl MultiSearch {
 					let md5 = md5.to_lowercase();
 					if !self.md5s.insert(md5.clone()) {
 						self.repeats += 1;
-						// Keep the copy whose image can be shown (Gelbooru's can't be).
+						// Keep the copy that can show its image; between equals,
+						// the site earlier in the list.
 						if let Some(kept) = out.iter_mut().find(|p: &&mut Post| p.md5.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(&md5)))
-							&& !self.shows_images(&kept.site)
-							&& self.shows_images(&post.site)
 						{
-							*kept = post;
+							let better = match (self.shows_images(&kept.site), self.shows_images(&post.site)) {
+								(false, true) => true,
+								(true, false) => false,
+								_ => self.site_rank(&post.site) < self.site_rank(&kept.site),
+							};
+							if better {
+								*kept = post;
+							}
 						}
 						continue;
 					}
@@ -241,8 +252,9 @@ mod tests {
 		assert_eq!(m.queries(), vec!["a: rating:s fox", "b: rating:s fox_ears"]);
 		assert!(m.notes().iter().any(|n| n.contains("“fox” is searched as “fox_ears” on b")));
 		let got: Vec<(String, u64)> = m.next(10, &store).unwrap().into_iter().map(|p| (p.site, p.id)).collect();
-		// Turns: a3, b90, then a2 (same file as b90, case aside: dropped), b80.
-		assert_eq!(got, vec![("a".to_string(), 3), ("b".into(), 90), ("b".into(), 80)]);
+		// Turns: a3, b90, then a2 (same file as b90, case aside: dropped, and a
+		// is earlier in the list so its copy wins the slot), b80.
+		assert_eq!(got, vec![("a".to_string(), 3), ("a".into(), 2), ("b".into(), 80)]);
 		assert_eq!(m.repeats, 1);
 		assert!(m.done());
 	}
