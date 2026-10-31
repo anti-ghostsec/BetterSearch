@@ -21,7 +21,7 @@ Settings; e621 asks every app to say who runs it.
 | e6ai | optional (its own account; e621's API) |
 | aibooru | optional (Danbooru's API) |
 | xbooru, TBIB, Hypnohub | not needed |
-| Realbooru (photos) | not needed; its API is switched off, so searches error |
+| Realbooru (photos) | not needed; read from its pages, since its API was shut off years ago |
 | yande.re, Konachan, Konachan.net, Sakugabooru | not needed (Moebooru) |
 
 All of those are off until ticked in the site menu, and every one can be mixed
@@ -77,7 +77,9 @@ On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
 doesn't count rating, score, size, date, id or md5, so those always go to the
 site; other tags are sent rarest first and the rest are checked here.
 Gelbooru-style sites have no alias API and no tag categories in post answers,
-so their tags all show as general.
+so their tags all show as general. Realbooru has no API at all: its list pages
+are read instead, and file addresses are rebuilt from the thumbnail's hash with
+the site as referer.
 
 ## Searching
 

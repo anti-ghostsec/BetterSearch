@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-use bettersearch_core::sites::{Danbooru, E621, Gelbooru, Moebooru, Site, user_agent};
+use bettersearch_core::sites::{Danbooru, E621, Gelbooru, Moebooru, Realbooru, Site, user_agent};
 use bettersearch_core::{Rating, Store};
 use serde::{Deserialize, Serialize};
 
@@ -204,7 +204,7 @@ pub fn make_sites(s: &Settings) -> Vec<Arc<dyn Site>> {
 	push(Gelbooru::xbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Gelbooru::tbib(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Gelbooru::hypnohub(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
-	push(Gelbooru::realbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Realbooru::new(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Moebooru::yande_re(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Moebooru::konachan(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Moebooru::konachan_net(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));

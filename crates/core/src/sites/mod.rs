@@ -5,6 +5,7 @@ mod danbooru;
 mod e621;
 mod gelbooru;
 mod moebooru;
+mod realbooru;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 
 pub use danbooru::Danbooru;
 pub use moebooru::Moebooru;
+pub use realbooru::Realbooru;
 pub use e621::E621;
 pub use gelbooru::Gelbooru;
 
