@@ -35,6 +35,22 @@ can be removed again. Logins are optional and only for sites that need one.
 `tools/probe-site.sh <host>` says in a few seconds whether a site is addable
 and which family to pick, without changing anything.
 
+## Taste
+
+Off by default. When on, ✨ searches for more of what you favorite, and a brief
+describes the taste in the panel's words.
+
+**What leaves the machine, and that's all:** the top 40 weighted tags, and the
+ratings you have ticked if "send the ratings I tick" is left on. No pictures,
+no post ids, no history, no account. That payload goes to whichever endpoint is
+set — Venice by default — with a plain User-Agent; the key stays in the vault.
+Nothing is sent until you press **Write brief**, and briefs are capped by the
+per-hour limit in the same section.
+
+The searches themselves never involve the model: they are built from the tag
+weights locally, so a bad brief can't send you somewhere you don't browse. The
+model only writes prose.
+
 ## Local API
 
 Off by default. ⚙ Settings → Local API lets a program on this computer search

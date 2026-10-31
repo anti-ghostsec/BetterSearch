@@ -34,6 +34,8 @@ pub enum Msg {
 	Image { url: String, image: Result<ColorImage, String> },
 	Animation { url: String, frames: Result<media::Frames, String> },
 	Video { url: String, video: Result<Box<Video>, String> },
+	/// A taste brief came back, or why it didn't.
+	Brief(Result<String, String>),
 	/// A file was written to disk, or why it wasn't.
 	Saved { site: String, id: u64, path: String, error: Option<String> },
 }
@@ -118,6 +120,16 @@ impl Worker {
 	}
 
 	/// Downloads a GIF (all frames) or a video (into memory, ready to play).
+	/// Asks the model for a brief. Off the UI thread, so typing carries on.
+	pub fn brief(&self, endpoint: String, key: String, model: String, tags: Vec<String>, ratings: Vec<Rating>, dial: f32) {
+		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+		std::thread::spawn(move || {
+			let got = bettersearch_core::taste::brief(&endpoint, &key, &model, &tags, &ratings, dial).map_err(|e| e.to_string());
+			let _ = tx.send(Msg::Brief(got));
+			ctx.request_repaint();
+		});
+	}
+
 	/// Fetches the post's real file (never the thumbnail) and writes it to `dir`.
 	pub fn save(&self, site: Arc<dyn Site>, post: Post, dir: std::path::PathBuf) {
 		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());

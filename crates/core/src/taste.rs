@@ -294,7 +294,7 @@ pub fn queries(taste: &Taste, ratings: &[Rating], want: usize) -> Result<Vec<Str
 /// Asks an OpenAI-compatible model (Venice by default) for the exaggerated
 /// brief. Only tags from `tags` survive, so the prose can't invent vocabulary
 /// the site doesn't have. `dial` sets how hard it leans in.
-pub fn brief(endpoint: &str, key: &str, model: &str, tags: &[String], dial: f32) -> Result<String> {
+pub fn brief(endpoint: &str, key: &str, model: &str, tags: &[String], ratings: &[Rating], dial: f32) -> Result<String> {
 	if model.trim().is_empty() {
 		return Err(crate::Error::Query("no model chosen".into()));
 	}
@@ -310,13 +310,20 @@ pub fn brief(endpoint: &str, key: &str, model: &str, tags: &[String], dial: f32)
 		 Two or three sentences, present tense, second person (\"you\"). \
 		 Only use tag names from the list you're given; you may describe what they mean."
 	);
+	// The ratings are a second, short line so the prose can mention how adult
+	// the browsing is without the tag list being polluted by them.
+	let mut asked = tags.join(", ");
+	if !ratings.is_empty() {
+		asked.push_str("\n\nRatings they browse: ");
+		asked.push_str(&ratings.iter().map(|r| r.label()).collect::<Vec<_>>().join(", "));
+	}
 	let body = serde_json::json!({
 		"model": model,
 		"max_tokens": 220,
 		"temperature": 0.9,
 		"messages": [
 			{ "role": "system", "content": system },
-			{ "role": "user", "content": tags.join(", ") },
+			{ "role": "user", "content": asked },
 		]
 	});
 	let client = reqwest::blocking::Client::builder()

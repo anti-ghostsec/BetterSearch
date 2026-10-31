@@ -166,6 +166,7 @@ struct App {
 	taste_brief: String,
 	taste_note: Option<String>,
 	file_note: Option<String>,
+	brief_calls: Vec<std::time::Instant>,
 	cookie_host: String,
 	cookie_text: String,
 	store: Arc<Mutex<Store>>,
@@ -268,6 +269,7 @@ impl App {
 			taste_brief,
 			taste_note: None,
 			file_note: None,
+			brief_calls: Vec::new(),
 			cookie_host: String::new(),
 			cookie_text: String::new(),
 			query: settings.last_search.clone(),
@@ -374,9 +376,16 @@ impl App {
 		self.search();
 	}
 
-	/// Asks the model for a new brief from the current profile.
+	/// Asks the model for a new brief from the current profile, on a thread.
 	fn write_brief(&mut self) {
 		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+		// The hourly limit, over the last hour of this run.
+		let hour = std::time::Duration::from_secs(3600);
+		self.brief_calls.retain(|t| t.elapsed() < hour);
+		if self.brief_calls.len() >= self.settings.taste.max_calls_per_hour.max(1) as usize {
+			self.taste_note = Some(format!("Limit reached: {} briefs an hour (Settings → Taste).", self.settings.taste.max_calls_per_hour));
+			return;
+		}
 		let built = {
 			let store = self.store.lock().unwrap();
 			taste::build(&store, &self.settings.ratings, now, self.settings.taste.dial_override)
@@ -389,17 +398,11 @@ impl App {
 			}
 		};
 		let tags: Vec<String> = profile.tags.iter().take(40).map(|t| t.tag.clone()).collect();
+		let ratings = if self.settings.taste.send_ratings { self.settings.ratings.clone() } else { Vec::new() };
 		let t = &self.settings.taste;
-		match taste::brief(&t.endpoint, &t.api_key, &t.model, &tags, profile.dial) {
-			Ok(text) => {
-				self.taste_brief = text.clone();
-				if let Ok(store) = self.store.lock() {
-					let _ = store.set_value("taste_brief", &text);
-				}
-				self.taste_note = None;
-			}
-			Err(e) => self.taste_note = Some(e.to_string()),
-		}
+		self.brief_calls.push(std::time::Instant::now());
+		self.worker.brief(t.endpoint.clone(), t.api_key.clone(), t.model.clone(), tags, ratings, profile.dial);
+		self.taste_note = Some("Asking the model…".into());
 	}
 
 	/// Starts, restarts or stops the local API to match the settings.
@@ -603,6 +606,18 @@ impl App {
 							}
 							Err(e) => Playing::Failed(url, e),
 						});
+					}
+				}
+				Msg::Brief(got) => {
+					match got {
+						Ok(text) => {
+							self.taste_brief = text.clone();
+							if let Ok(store) = self.store.lock() {
+								let _ = store.set_value("taste_brief", &text);
+							}
+							self.taste_note = None;
+						}
+						Err(e) => self.taste_note = Some(e),
 					}
 				}
 				Msg::Saved { site, id, path, error } => {
@@ -2024,6 +2039,19 @@ impl App {
 					}
 				});
 				ui.horizontal(|ui| {
+					changed |= ui.checkbox(&mut self.settings.taste.send_ratings, "Send the ratings I tick").changed();
+					ui.label(RichText::new("· briefs a").weak());
+					let mut cap = self.settings.taste.max_calls_per_hour;
+					changed |= ui.add(egui::DragValue::new(&mut cap).range(1..=1000)).changed();
+					self.settings.taste.max_calls_per_hour = cap;
+					ui.label(RichText::new("hour").weak());
+				});
+				ui.label(
+					RichText::new("Only the top tags (and the ratings, if ticked) are sent — no pictures, ids or history.")
+						.weak()
+						.small(),
+				);
+				ui.horizontal(|ui| {
 					if ui.button("Write brief").clicked() {
 						self.write_brief();
 					}
@@ -2588,6 +2616,18 @@ mod tests {
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
+
+	/// The hourly brief limit is enforced before any network call.
+	#[test]
+	fn briefs_stop_at_the_hourly_limit() {
+		let (mut app, _ctx, dir) = app_with_posts("png", 1);
+		app.settings.taste.enabled = true;
+		app.settings.taste.max_calls_per_hour = 1;
+		app.brief_calls.push(std::time::Instant::now());
+		app.write_brief();
+		assert!(app.taste_note.as_deref().is_some_and(|n| n.contains("Limit reached")), "{:?}", app.taste_note);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
 
 	/// A GIF post plays in the large view: all frames, Space pauses.
 	#[test]
