@@ -509,7 +509,7 @@ impl App {
 		self.texture(site, url).cloned()
 	}
 
-	/// Whether a site lets this app load its images (gelbooru.com doesn't).
+	/// Whether a site lets this app load its images (only if it needs a referer, like gelbooru.com).
 	fn site_shows(&self, id: &str) -> bool {
 		self.site_by_id(id).is_none_or(|s| s.shows_images())
 	}
