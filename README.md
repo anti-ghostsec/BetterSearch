@@ -21,6 +21,7 @@ Settings; e621 asks every app to say who runs it.
 | e6ai | optional (its own account; e621's API) |
 | aibooru | optional (Danbooru's API) |
 | xbooru, TBIB, Hypnohub | not needed |
+| Realbooru (photos) | not needed; its API is switched off, so searches error |
 | yande.re, Konachan, Konachan.net, Sakugabooru | not needed (Moebooru) |
 
 All of those are off until ticked in the site menu, and every one can be mixed

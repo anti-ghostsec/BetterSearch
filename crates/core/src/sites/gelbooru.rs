@@ -89,6 +89,12 @@ impl Gelbooru {
 		Self::custom("hypnohub", "Hypnohub", "https://hypnohub.net", user_agent)
 	}
 
+	/// Real photos. Its API is switched off by the site, so this is here for
+	/// completeness and errors clearly; browsing still needs the page.
+	pub fn realbooru(user_agent: &str) -> Result<Self> {
+		Self::custom("realbooru", "Realbooru (photos)", "https://realbooru.com", user_agent)
+	}
+
 	pub fn new(
 		id: &str,
 		name: &str,

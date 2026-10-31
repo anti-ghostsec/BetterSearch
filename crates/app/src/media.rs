@@ -112,7 +112,7 @@ impl Video {
 			duration: 0.0,
 			fps: 30.0,
 			has_audio: false,
-			muted: false,
+			muted: true,
 			paused: false,
 			child: None,
 			start: 0.0,

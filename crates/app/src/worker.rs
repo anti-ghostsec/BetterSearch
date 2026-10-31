@@ -34,6 +34,8 @@ pub enum Msg {
 	Image { url: String, image: Result<ColorImage, String> },
 	Animation { url: String, frames: Result<media::Frames, String> },
 	Video { url: String, video: Result<Box<Video>, String> },
+	/// A file was written to disk, or why it wasn't.
+	Saved { site: String, id: u64, path: String, error: Option<String> },
 }
 
 pub struct Worker {
@@ -116,6 +118,33 @@ impl Worker {
 	}
 
 	/// Downloads a GIF (all frames) or a video (into memory, ready to play).
+	/// Fetches the post's real file (never the thumbnail) and writes it to `dir`.
+	pub fn save(&self, site: Arc<dyn Site>, post: Post, dir: std::path::PathBuf) {
+		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+		std::thread::spawn(move || {
+			let (site_id, id) = (post.site.clone(), post.id);
+			let url = post.file_url.clone().or(post.sample_url.clone()).or(post.preview_url.clone());
+			let mut path = String::new();
+			let mut error = None;
+			match url {
+				None => error = Some("the site sent no file for this post".to_string()),
+				Some(url) => {
+					let ext = url.split('?').next().and_then(|u| u.rsplit_once('.')).map(|(_, e)| e.to_lowercase()).unwrap_or_else(|| post.ext.clone());
+					let dest = dir.join(format!("{site_id}_{id}.{ext}"));
+					match site.fetch_bytes(&url) {
+						Err(e) => error = Some(e.to_string()),
+						Ok(bytes) => match std::fs::write(&dest, &bytes) {
+							Ok(()) => path = dest.display().to_string(),
+							Err(e) => error = Some(e.to_string()),
+						},
+					}
+				}
+			}
+			let _ = tx.send(Msg::Saved { site: site_id, id, path, error });
+			ctx.request_repaint();
+		});
+	}
+
 	pub fn media(&self, site: Arc<dyn Site>, url: String, video: bool) {
 		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
 		std::thread::spawn(move || {

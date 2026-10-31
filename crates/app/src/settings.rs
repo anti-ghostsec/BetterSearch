@@ -204,6 +204,7 @@ pub fn make_sites(s: &Settings) -> Vec<Arc<dyn Site>> {
 	push(Gelbooru::xbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Gelbooru::tbib(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Gelbooru::hypnohub(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
+	push(Gelbooru::realbooru(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Moebooru::yande_re(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Moebooru::konachan(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));
 	push(Moebooru::konachan_net(&anon).ok().map(|x| Arc::new(x) as Arc<dyn Site>));

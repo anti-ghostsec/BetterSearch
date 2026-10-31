@@ -110,6 +110,8 @@ enum Action {
 	ShowFavorites,
 	/// Shows a post large.
 	View(usize),
+	/// Writes the post's real file to the downloads folder.
+	Save(usize),
 	CloseViewer,
 	/// Moves to the post this many places on (the one shown large, or selected).
 	Step(i64),
@@ -163,6 +165,7 @@ struct App {
 	api_started: bool,
 	taste_brief: String,
 	taste_note: Option<String>,
+	file_note: Option<String>,
 	cookie_host: String,
 	cookie_text: String,
 	store: Arc<Mutex<Store>>,
@@ -264,6 +267,7 @@ impl App {
 			api_started: false,
 			taste_brief,
 			taste_note: None,
+			file_note: None,
 			cookie_host: String::new(),
 			cookie_text: String::new(),
 			query: settings.last_search.clone(),
@@ -322,6 +326,24 @@ impl App {
 		s.auto_links = self.settings.auto_links;
 		self.settings.save(&s);
 		self.urgent = true;
+	}
+
+	/// Writes the full file (not the thumbnail) to the downloads folder.
+	fn save_post(&mut self, i: usize) {
+		let Some(post) = self.posts.get(i).cloned() else { return };
+		let Some(site) = self.site_by_id(&post.site) else {
+			self.file_note = Some(format!("{} isn't loaded", post.site));
+			return;
+		};
+		let dir = dirs::download_dir()
+			.or_else(dirs::picture_dir)
+			.unwrap_or_else(settings::data_dir)
+			.join("BetterSearch");
+		if let Err(e) = std::fs::create_dir_all(&dir) {
+			self.file_note = Some(e.to_string());
+			return;
+		}
+		self.worker.save(site, post, dir);
 	}
 
 	/// Runs the kind of searches the profile points at, together.
@@ -582,6 +604,12 @@ impl App {
 							Err(e) => Playing::Failed(url, e),
 						});
 					}
+				}
+				Msg::Saved { site, id, path, error } => {
+					self.file_note = Some(match error {
+						Some(e) => format!("{site} {id}: {e}"),
+						None => format!("Saved {path}"),
+					});
 				}
 				Msg::Image { url, image } => {
 					let tex = match image {
@@ -890,6 +918,7 @@ impl App {
 						let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
 					}
 				}
+				Action::Save(i) => self.save_post(i),
 				Action::VoteTag(..)
 				| Action::AddLink
 				| Action::RemoveLink(_)
@@ -1199,8 +1228,14 @@ impl App {
 						if ui.button(if self.favorites.contains(&self.posts[i].key()) { "Remove from favorites" } else { "Add to favorites" }).clicked() {
 							actions.push(Action::ToggleFavorite(i));
 						}
+						if ui.button("Save file").on_hover_text("The full file, not the thumbnail").clicked() {
+							actions.push(Action::Save(i));
+						}
 						if ui.button("View large").clicked() {
 							actions.push(Action::View(i));
+						}
+						if ui.button("Open page").clicked() {
+							actions.push(Action::Open(self.posts[i].page_url.clone()));
 						}
 					});
 				}
@@ -1236,6 +1271,8 @@ impl App {
 		};
 		let query = self.query.clone();
 		egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+			let video = matches!(post.ext.as_str(), "webm" | "mp4" | "swf");
+			let animated = video || post.ext == "gif";
 			let url = post.sample_url.clone().or(post.preview_url.clone());
 			if !self.site_shows(&post.site) {
 				ui.label(
@@ -1245,6 +1282,14 @@ impl App {
 					))
 					.weak(),
 				);
+			} else if animated && media_ok(video) && let Some(file) = post.file_url.clone() {
+				if self.playing.as_ref().is_none_or(|p| p.url() != file) {
+					if let Some(site) = self.site_by_id(&post.site) {
+						self.worker.media(site, file.clone(), video);
+					}
+					self.playing = Some(Playing::Loading(file));
+				}
+				self.play(ui, actions);
 			} else if let Some(t) = url.as_deref().and_then(|u| self.big_texture(&post.site, u)) {
 				let w = ui.available_width();
 				let size = t.size_vec2();
@@ -1278,6 +1323,11 @@ impl App {
 				{
 					actions.push(Action::View(i));
 				}
+				if ui.button("Save").on_hover_text("The full file, not the thumbnail").clicked()
+					&& let Some(i) = self.selected
+				{
+					actions.push(Action::Save(i));
+				}
 				if ui.button("Open page").clicked() {
 					actions.push(Action::Open(post.page_url.clone()));
 				}
@@ -1287,6 +1337,55 @@ impl App {
 					actions.push(Action::Open(f.clone()));
 				}
 			});
+			ui.group(|ui| {
+				ui.horizontal(|ui| {
+					ui.label(RichText::new("Site").weak());
+					ui.strong(&post.site);
+					ui.label(RichText::new(format!("· #{}{}", post.id, if post.ext.is_empty() { "" } else { " · " })).weak());
+					if !post.ext.is_empty() {
+						ui.label(RichText::new(&post.ext).weak());
+					}
+				});
+				ui.horizontal(|ui| {
+					ui.label(RichText::new("File").weak());
+					match &post.file_url {
+						Some(f) => {
+							let r = ui
+								.add(egui::Label::new(RichText::new(f).monospace().small()).truncate().sense(Sense::click()))
+								.on_hover_text("Click to copy the address");
+							if r.clicked() {
+								ui.ctx().copy_text(f.clone());
+							}
+						}
+						None => {
+							ui.label(RichText::new("the site sent no file").weak());
+						}
+					}
+				});
+				if !post.sources.is_empty() {
+					ui.horizontal(|ui| {
+						ui.label(RichText::new("Source").weak());
+						for (n, src) in post.sources.iter().take(2).enumerate() {
+							if n > 0 {
+								ui.label("·");
+							}
+							if ui
+								.add(egui::Label::new(RichText::new(src).small()).truncate().sense(Sense::click()))
+								.on_hover_text("Click to open")
+								.clicked()
+							{
+								actions.push(Action::Open(src.clone()));
+							}
+						}
+					});
+				}
+				ui.horizontal(|ui| {
+					ui.label(RichText::new(format!("{}·{}·{} · {}", post.width, post.height, post.rating.label(), post.created_at)).weak().small());
+				});
+			});
+			if let Some(note) = &self.file_note {
+				ui.label(RichText::new(note).weak().small());
+			}
 			ui.horizontal(|ui| {
 				if ui.button("Find similar").on_hover_text("Posts sharing the most telling tags with this one").clicked()
 					&& let Some(i) = self.selected
@@ -1414,7 +1513,7 @@ impl App {
 		let shown: Vec<usize> = (0..self.posts.len()).filter(|&j| self.visible(j)).collect();
 		let at = shown.iter().position(|&j| j == i).map_or(0, |p| p + 1);
 		let video = matches!(post.ext.as_str(), "webm" | "mp4" | "swf");
-		ui.horizontal(|ui| {
+		let bar = ui.horizontal(|ui| {
 			if ui.button("◀").on_hover_text("Previous (←)").clicked() {
 				actions.push(Action::Step(-1));
 			}
@@ -1439,6 +1538,9 @@ impl App {
 				if ui.button(RichText::new(if fav { "♥" } else { "♡" }).color(Color32::from_rgb(230, 90, 120))).on_hover_text("Favorite (F)").clicked() {
 					actions.push(Action::ToggleFavorite(i));
 				}
+				if ui.button("Save").on_hover_text("The full file, not the sample").clicked() {
+					actions.push(Action::Save(i));
+				}
 				if ui.button("Open page").clicked() {
 					actions.push(Action::Open(post.page_url.clone()));
 				}
@@ -1449,6 +1551,17 @@ impl App {
 					actions.push(Action::Open(f.clone()));
 				}
 			});
+		});
+		bar.response.context_menu(|ui| {
+			if ui.button("Save file").on_hover_text("The full file, not the sample").clicked() {
+				actions.push(Action::Save(i));
+			}
+			if ui.button("Open page").clicked() {
+				actions.push(Action::Open(post.page_url.clone()));
+			}
+			if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked() {
+				actions.push(Action::ToggleFavorite(i));
+			}
 		});
 		ui.separator();
 		if !self.site_shows(&post.site) {
