@@ -94,8 +94,9 @@ expires.
 no browser files at all, and cookies come only from the button or a paste.
 Tick it and a stale cookie is refreshed by itself before a search.
 
-Wisp keeps its session in memory, so there is no file to read — paste is the
-way for it. `cf_clearance` usually lasts hours, not days. Cloudflare ties it to the browser's
+Wisp keeps its session in memory by default; turn on **Persistent profile** in
+its menu, load the site, and its WebKit cookie store is read like a Firefox
+profile. Otherwise paste. `cf_clearance` usually lasts hours, not days. Cloudflare ties it to the browser's
 User-Agent, so the app sends a Firefox one on hosts it holds a cookie for
 instead of its own; if the browser's version differs a lot the cookie can still
 be refused, in which case paste again.

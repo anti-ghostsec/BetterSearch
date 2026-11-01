@@ -14,6 +14,15 @@ use rusqlite::{Connection, OpenFlags};
 /// along too, because the site's own session is usually needed as well.
 pub const CLEARANCE: &[&str] = &["cf_clearance", "__cf_bm", "cf_chl_2", "cf_chl_prog", "cf_chl_seq"];
 
+/// Wisp's WebKit cookie stores, which exist only with its persistent profile on.
+/// Wisp keeps no plaintext history, so this is the only file of its that says
+/// anything about where you've been.
+fn wisp_dbs() -> Vec<PathBuf> {
+	let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+	let dir = home.join(".local/share/wisp/profile");
+	["cookies.db", "cookies.sqlite", "cookies.sqlite3"].iter().map(|n| dir.join(n)).filter(|p| p.is_file()).collect()
+}
+
 /// Every `cookies.sqlite` a Firefox-family browser keeps on this machine.
 pub fn profiles() -> Vec<PathBuf> {
 	let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
@@ -64,6 +73,44 @@ fn from_profile(db: &Path, host: &str) -> String {
 	pairs.into_iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ")
 }
 
+/// Cookies for a host out of a WebKit store. If the immutable open finds none
+/// (recent cookies may still be in the WAL), the files are copied aside first.
+fn from_webkit(db: &Path, host: &str) -> String {
+	let query = "SELECT name, value FROM cookies WHERE domain = ?1 OR domain = ?2";
+	let read = |conn: &Connection| -> Vec<(String, String)> {
+		let Ok(mut st) = conn.prepare(query) else { return Vec::new() };
+		let Ok(rows) = st.query_map([host, &format!(".{host}")], |r| Ok((r.get(0)?, r.get(1)?))) else { return Vec::new() };
+		rows.flatten().collect()
+	};
+	if let Some(conn) = open(db) {
+		let rows = read(&conn);
+		if !rows.is_empty() {
+			return pairs(rows);
+		}
+	}
+	// Copy the set aside so a running browser's WAL is seen too.
+	let which = db.parent().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy().into_owned();
+	let tmp = std::env::temp_dir().join(format!("bs-web-{}-{which}", std::process::id()));
+	let _ = std::fs::create_dir_all(&tmp);
+	let copied = tmp.join("cookies.db");
+	let ok = std::fs::copy(db, &copied).is_ok()
+		&& std::fs::copy(format!("{}-wal", db.display()), format!("{}-wal", copied.display())).is_ok();
+	let rows = if ok {
+		Connection::open(&copied).ok().map(|c| read(&c)).unwrap_or_default()
+	} else {
+		Vec::new()
+	};
+	let _ = std::fs::remove_dir_all(&tmp);
+	pairs(rows)
+}
+
+/// Clearance first, so a server reading only the first cookie sees it.
+fn pairs(mut rows: Vec<(String, String)>) -> String {
+	rows.retain(|(_, v)| !v.is_empty());
+	rows.sort_by_key(|(n, _)| !CLEARANCE.contains(&n.as_str()));
+	rows.into_iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ")
+}
+
 /// The best cookie header each of `hosts` has, and how many cookies it holds.
 /// Profiles that know nothing about a host are skipped.
 pub fn harvest(hosts: &[String]) -> Vec<(String, String, usize)> {
@@ -71,6 +118,13 @@ pub fn harvest(hosts: &[String]) -> Vec<(String, String, usize)> {
 	let mut out = Vec::new();
 	for host in hosts.iter().filter(|h| !h.is_empty()) {
 		let mut best = (String::new(), 0usize);
+		for db in wisp_dbs().iter() {
+			let header = from_webkit(db, host);
+			let n = header.matches('=').count();
+			if n > best.1 {
+				best = (header, n);
+			}
+		}
 		for db in &profiles {
 			let header = from_profile(db, host);
 			let n = header.matches('=').count();
@@ -104,6 +158,24 @@ mod tests {
 	#[test]
 	fn a_missing_host_harvests_nothing() {
 		assert!(harvest(&["nope.invalid".into()]).is_empty());
+	}
+
+	#[test]
+	fn reads_a_webkit_store() {
+		let dir = std::env::temp_dir().join(format!("bs-webkit-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let db = dir.join("cookies.db");
+		let conn = Connection::open(&db).unwrap();
+		conn.execute_batch(
+			"CREATE TABLE cookies (name TEXT, value TEXT, domain TEXT, path TEXT);
+			 INSERT INTO cookies VALUES ('cf_clearance','abc','.x.test','/');
+			 INSERT INTO cookies VALUES ('other','1','.elsewhere','/');",
+		)
+		.unwrap();
+		drop(conn);
+		assert_eq!(from_webkit(&db, "x.test"), "cf_clearance=abc");
+		assert_eq!(from_webkit(&db, "nothing.test"), "");
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
 	#[test]

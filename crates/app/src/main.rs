@@ -2470,7 +2470,7 @@ impl App {
 					}
 				}
 			});
-			if ui.button("Copy cookies now").on_hover_text("Works whether or not the box above is ticked; needs a Firefox or LibreWolf profile").clicked() {
+			if ui.button("Copy cookies now").on_hover_text("Works whether or not the box above is ticked; needs a Firefox/LibreWolf profile or Wisp's persistent profile").clicked() {
 				let hosts: Vec<String> = self.current_sites().iter().map(|s| cookies::host_of(s.base())).filter(|h| !h.is_empty()).collect();
 				let mut got = 0;
 				for (host, header, _) in cookies::harvest(&hosts) {
@@ -2481,7 +2481,7 @@ impl App {
 					got += 1;
 				}
 				self.api_note = Some(if got == 0 {
-					"None found. Firefox and LibreWolf keep cookies on disk; Wisp keeps its session in memory, so use Paste below for it.".into()
+					"None found. Turn on Wisp's persistent profile and reload the site, or use Firefox/LibreWolf; or paste below.".into()
 				} else {
 					format!("Copied cookies for {got} site(s).")
 				});
