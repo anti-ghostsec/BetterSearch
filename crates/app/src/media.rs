@@ -188,7 +188,12 @@ impl Video {
 		self.ended.store(false, Ordering::SeqCst);
 		let (w, h) = self.out;
 		let mut cmd = self.command("ffmpeg");
-		cmd.args(["-nostdin", "-ss", &format!("{:.3}", self.start), "-re", "-i"]).arg(self.path());
+		// A thread or two, not one per core: by itself ffmpeg spreads even a
+		// small video over every core, a load that makes some computers' screens
+		// glitch. Two keep up with HD, four with anything bigger.
+		let threads = if self.width > 1920 { "4" } else { "2" };
+		cmd.args(["-nostdin", "-filter_threads", "1", "-threads", threads]);
+		cmd.args(["-ss", &format!("{:.3}", self.start), "-re", "-i"]).arg(self.path());
 		cmd.args(["-map", "0:v:0", "-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]);
 		if self.has_audio && !self.muted {
 			cmd.args(["-map", "0:a:0"]);

@@ -47,8 +47,22 @@ fn main() -> eframe::Result {
 		viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]).with_title("BetterSearch"),
 		..Default::default()
 	};
-	eframe::run_native("BetterSearch", options, Box::new(|cc| Ok(Box::new(Root::new(cc.egui_ctx.clone())))))
+	eframe::run_native(
+		"BetterSearch",
+		options,
+		Box::new(|cc| {
+			if let Some(gl) = &cc.gl {
+				use eframe::glow::HasContext;
+				// SAFETY: a plain query on the context eframe has just made current.
+				let _ = RENDERER.set(unsafe { gl.get_parameter_string(eframe::glow::RENDERER) });
+			}
+			Ok(Box::new(Root::new(cc.egui_ctx.clone())))
+		}),
+	)
 }
+
+/// The graphics card and driver the window is drawn with, as OpenGL names them.
+static RENDERER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The GIF or video in the large view.
 enum Playing {
@@ -124,6 +138,8 @@ enum Action {
 	FavoriteTicked(bool),
 	/// Hands the ticked posts' files to the share box.
 	ShareTicked,
+	/// Hands one post's file to the share box.
+	Share(usize),
 	CloseViewer,
 	/// Moves to the post this many places on (the one shown large, or selected).
 	Step(i64),
@@ -595,6 +611,12 @@ impl App {
 	fn save_post(&mut self, i: usize) {
 		let Some(post) = self.posts.get(i) else { return };
 		self.save_dialog = Some(SaveDialog { i, dir: self.download_dir(), name: share::file_name(post, None), error: None });
+	}
+
+	/// Opens the share box with one post's file, straight from memory.
+	fn share_post(&mut self, site: Arc<dyn Site>, post: Post, tool: std::path::PathBuf) {
+		self.tick_note = Some(format!("Fetching #{} to share…", post.id));
+		self.worker.share(site, post, tool);
 	}
 
 	/// The ticked posts in grid order, with their sites.
@@ -1285,11 +1307,18 @@ impl App {
 					// as files, so those are saved first, as Download would.
 					if posts.len() == 1 {
 						let (site, post) = posts.remove(0);
-						self.tick_note = Some(format!("Fetching #{} to share…", post.id));
-						self.worker.share(site, post, tool);
+						self.share_post(site, post, tool);
 					} else if !posts.is_empty() {
 						self.tick_note = Some(format!("Saving {} files to share…", posts.len()));
 						self.worker.download(posts, self.download_dir(), Some(tool));
+					}
+				}
+				Action::Share(i) => {
+					if let Some(tool) = self.share_tool.clone()
+						&& let Some(post) = self.posts.get(i).cloned()
+						&& let Some(site) = self.site_by_id(&post.site)
+					{
+						self.share_post(site, post, tool);
 					}
 				}
 				Action::VoteTag(..)
@@ -1637,6 +1666,9 @@ impl App {
 						if ui.button("Save file").on_hover_text("The full file, not the thumbnail").clicked() {
 							actions.push(Action::Save(i));
 						}
+						if self.share_tool.is_some() && ui.button("Share").on_hover_text("Opens the share box with this file").clicked() {
+							actions.push(Action::Share(i));
+						}
 						if ui.button("View large").clicked() {
 							actions.push(Action::View(i));
 						}
@@ -1745,6 +1777,12 @@ impl App {
 					{
 						actions.push(Action::Save(i));
 					}
+					if self.share_tool.is_some()
+						&& ui.button("Share").on_hover_text("Opens the share box with this file").clicked()
+						&& let Some(i) = self.selected
+					{
+						actions.push(Action::Share(i));
+					}
 					if ui.button("Open page").clicked() {
 						actions.push(Action::Open(post.page_url.clone()));
 					}
@@ -1848,6 +1886,12 @@ impl App {
 					&& let Some(i) = self.selected
 				{
 					actions.push(Action::Save(i));
+				}
+				if self.share_tool.is_some()
+					&& ui.button("Share").on_hover_text("Opens the share box with this file").clicked()
+					&& let Some(i) = self.selected
+				{
+					actions.push(Action::Share(i));
 				}
 				if ui.button("Open page").clicked() {
 					actions.push(Action::Open(post.page_url.clone()));
@@ -2028,6 +2072,9 @@ impl App {
 			if ui.button("Save file").on_hover_text("The full file, not the sample").clicked() {
 				actions.push(Action::Save(i));
 			}
+			if self.share_tool.is_some() && ui.button("Share").on_hover_text("Opens the share box with this file").clicked() {
+				actions.push(Action::Share(i));
+			}
 			if ui.button("Open page").clicked() {
 				actions.push(Action::Open(post.page_url.clone()));
 			}
@@ -2087,6 +2134,9 @@ impl App {
 				pic.context_menu(|ui| {
 					if ui.button("Save file…").clicked() {
 						actions.push(Action::Save(i));
+					}
+					if self.share_tool.is_some() && ui.button("Share").on_hover_text("Opens the share box with this file").clicked() {
+						actions.push(Action::Share(i));
 					}
 					if ui.button("Open page").clicked() {
 						actions.push(Action::Open(post.page_url.clone()));
@@ -2166,6 +2216,8 @@ impl App {
 				if let Some((n, img)) = video.frame_after(*seen) {
 					*seen = n;
 					match tex {
+						// Each frame is written over the last, not given a new texture.
+						Some(t) if t.size() == img.size => t.set_partial([0, 0], img, egui::TextureOptions::LINEAR),
 						Some(t) => t.set(img, egui::TextureOptions::LINEAR),
 						None => *tex = Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR)),
 					}
@@ -2198,9 +2250,8 @@ impl App {
 						ui.label(RichText::new("no sound").weak());
 					}
 				});
-				if !video.paused {
-					ctx.request_repaint_after(std::time::Duration::from_millis(15));
-				}
+				// No timer: each new frame asks for the repaint that shows it, so
+				// the window redraws at the video's own rate.
 			}
 		}
 	}
@@ -2678,6 +2729,15 @@ impl App {
 					self.sync_api();
 				}
 				ui.label(RichText::new(format!("Port and token are in {}", settings::data_dir().join("api.json").display())).weak());
+			}
+			if let Some(gpu) = RENDERER.get() {
+				ui.add_space(8.0);
+				ui.separator();
+				ui.strong("Graphics");
+				ui.label(RichText::new(format!("Drawn on {gpu}")).weak());
+				if gpu.contains("llvmpipe") || gpu.contains("softpipe") {
+					ui.label(RichText::new("That's the processor, not a graphics card: OpenGL found no card it could use.").weak());
+				}
 			}
 			ui.add_space(8.0);
 			ui.separator();
@@ -3253,6 +3313,32 @@ mod tests {
 		assert_eq!(tick_note(&mut app, &ctx), "The share box has e926_3.png.");
 		assert_eq!(super::share::wait_for(&dir.join("args")), "--stdin\ne926_3.png\n");
 		assert!(super::share::wait_for(&dir.join("stdin")).ends_with("PNG\r\n\u{1a}\nhttps://example.invalid/3.png"));
+		std::fs::remove_file(dir.join("args")).unwrap();
+		std::fs::remove_file(dir.join("stdin")).unwrap();
+
+		// Share in a right-click menu: that one post, ticked or not.
+		app.apply(vec![super::Action::Share(1)]);
+		assert_eq!(tick_note(&mut app, &ctx), "The share box has e926_2.png.");
+		assert_eq!(super::share::wait_for(&dir.join("args")), "--stdin\ne926_2.png\n");
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Right-clicking a thumbnail offers Share only where there's a share box.
+	#[test]
+	fn share_in_the_right_click_menu() {
+		let (mut app, ctx, dir) = app_with_posts("menu", 2);
+		app.share_tool = Some(dir.join("ferro-share"));
+		let shown = |app: &mut super::App| texts(app, &ctx, 1300.0).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+		let middle = texts(&mut app, &ctx, 1300.0).into_iter().find(|(t, _)| t == "…").unwrap().1.center();
+		let right = |pressed| egui::Event::PointerButton { pos: middle, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE };
+		texts_with(&mut app, &ctx, 1300.0, vec![egui::Event::PointerMoved(middle)]);
+		texts_with(&mut app, &ctx, 1300.0, vec![right(true)]);
+		texts_with(&mut app, &ctx, 1300.0, vec![right(false)]);
+		let menu = shown(&mut app);
+		assert!(menu.iter().any(|t| t == "Save file") && menu.iter().any(|t| t == "Share"), "{menu:?}");
+		app.share_tool = None;
+		let menu = shown(&mut app);
+		assert!(menu.iter().any(|t| t == "Save file") && !menu.iter().any(|t| t == "Share"), "{menu:?}");
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
