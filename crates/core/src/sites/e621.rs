@@ -75,11 +75,19 @@ impl E621 {
 
 	fn get<T: for<'de> Deserialize<'de>>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
 		// A busy site answers 503 ("temporarily unavailable"): wait and try again, a little longer each time.
+		let url = format!("{}{path}", self.base);
 		let mut tries = 0;
+		// Set when a challenge page came back with a cookie: the cookie may have
+		// been earned under the other browser's UA, so it gets one try with it.
+		let mut other_ua: Option<String> = None;
+		let mut swapped = false;
 		let res = loop {
 			self.throttle.wait();
-			let url = format!("{}{path}", self.base);
-		let mut req = super::with_cookie(self.client.get(url), &format!("{}{path}", self.base)).query(query);
+			let mut req = super::with_cookie(self.client.get(&url), &url).query(query);
+			if let Some(ua) = &other_ua {
+				req = req.header(reqwest::header::COOKIE, super::cookie_for(&url).map(|c| c.0).unwrap_or_default());
+				req = req.header(reqwest::header::USER_AGENT, ua.as_str());
+			}
 			if let Some((u, k)) = &self.login {
 				req = req.basic_auth(u, Some(k));
 			}
@@ -88,6 +96,15 @@ impl E621 {
 				tries += 1;
 				std::thread::sleep(Duration::from_secs(2 * tries));
 				continue;
+			}
+			// A challenge page, and a cookie to try the other way round.
+			if res.status().is_success() && !swapped {
+				let html = res.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.contains("html"));
+				if html && let Some((_, ua)) = super::other_cookie_ua(&url) {
+					swapped = true;
+					other_ua = Some(ua);
+					continue;
+				}
 			}
 			break res;
 		};

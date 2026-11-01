@@ -182,6 +182,17 @@ pub fn cookie_for(url: &str) -> Option<(String, String)> {
 
 /// The UA a clearance cookie was earned under. Cloudflare ties `cf_clearance`
 /// to it, so a cookie sent with the app's own UA is refused.
+/// A WebKit UA, the other kind a cookie may have been earned under.
+pub const WEBKIT_UA: &str =
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+
+/// The cookie with the *other* UA, for one retry when a site refuses the pair.
+pub fn other_cookie_ua(url: &str) -> Option<(String, String)> {
+	let (cookie, ua) = cookie_for(url)?;
+	let other = if ua == BROWSER_UA { WEBKIT_UA } else { BROWSER_UA };
+	Some((cookie, other.to_string()))
+}
+
 /// The Firefox UA used when nothing better is known.
 pub fn firefox_ua() -> &'static str {
 	BROWSER_UA
