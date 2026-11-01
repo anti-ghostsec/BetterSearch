@@ -131,8 +131,8 @@ impl Worker {
 	/// Copies browser cookies for these hosts, off the UI thread.
 	pub fn harvest(&self, hosts: Vec<String>, store: Arc<Mutex<Store>>, ctx: egui::Context) {
 		std::thread::spawn(move || {
-			for (host, header, _) in crate::cookies::harvest(&hosts) {
-				bettersearch_core::sites::set_cookie(&host, &header);
+			for (host, header, ua, _) in crate::cookies::harvest(&hosts) {
+				bettersearch_core::sites::set_cookie_as(&host, &header, &ua);
 				if let Ok(s) = store.lock() {
 					let _ = s.set_cookie(&host, &header);
 				}

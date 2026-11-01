@@ -73,6 +73,18 @@ fn from_profile(db: &Path, host: &str) -> String {
 	pairs.into_iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ")
 }
 
+/// The UA Wisp would use: its own setting if one is set, else a WebKit one.
+/// A clearance cookie is bound to it, so it has to go out with the cookie.
+fn wisp_ua() -> String {
+	let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+	let set = std::fs::read_to_string(home.join(".config/wisp/config.json"))
+		.ok()
+		.and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+		.and_then(|v| v["user_agent"].as_str().map(str::to_string))
+		.filter(|u| !u.trim().is_empty());
+	set.unwrap_or_else(|| "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15".into())
+}
+
 /// Cookies for a host out of a WebKit store. If the immutable open finds none
 /// (recent cookies may still be in the WAL), the files are copied aside first.
 fn from_webkit(db: &Path, host: &str) -> String {
@@ -113,27 +125,27 @@ fn pairs(mut rows: Vec<(String, String)>) -> String {
 
 /// The best cookie header each of `hosts` has, and how many cookies it holds.
 /// Profiles that know nothing about a host are skipped.
-pub fn harvest(hosts: &[String]) -> Vec<(String, String, usize)> {
+pub fn harvest(hosts: &[String]) -> Vec<(String, String, String, usize)> {
 	let profiles = profiles();
+	let wisp = wisp_dbs();
+	let wisp_ua = wisp_ua();
 	let mut out = Vec::new();
 	for host in hosts.iter().filter(|h| !h.is_empty()) {
-		let mut best = (String::new(), 0usize);
-		for db in wisp_dbs().iter() {
-			let header = from_webkit(db, host);
+		let mut best = (String::new(), String::new(), 0usize);
+		let offer = |header: String, ua: &str, best: &mut (String, String, usize)| {
 			let n = header.matches('=').count();
-			if n > best.1 {
-				best = (header, n);
+			if n > best.2 {
+				*best = (header, ua.to_string(), n);
 			}
+		};
+		for db in &wisp {
+			offer(from_webkit(db, host), &wisp_ua, &mut best);
 		}
 		for db in &profiles {
-			let header = from_profile(db, host);
-			let n = header.matches('=').count();
-			if n > best.1 {
-				best = (header, n);
-			}
+			offer(from_profile(db, host), bettersearch_core::sites::firefox_ua(), &mut best);
 		}
 		if !best.0.is_empty() {
-			out.push((host.clone(), best.0, best.1));
+			out.push((host.clone(), best.0, best.1, best.2));
 		}
 	}
 	out

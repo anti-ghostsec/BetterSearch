@@ -2473,8 +2473,8 @@ impl App {
 			if ui.button("Copy cookies now").on_hover_text("Works whether or not the box above is ticked; needs a Firefox/LibreWolf profile or Wisp's persistent profile").clicked() {
 				let hosts: Vec<String> = self.current_sites().iter().map(|s| cookies::host_of(s.base())).filter(|h| !h.is_empty()).collect();
 				let mut got = 0;
-				for (host, header, _) in cookies::harvest(&hosts) {
-					bettersearch_core::sites::set_cookie(&host, &header);
+				for (host, header, ua, _) in cookies::harvest(&hosts) {
+					bettersearch_core::sites::set_cookie_as(&host, &header, &ua);
 					if let Ok(store) = self.store.lock() {
 						let _ = store.set_cookie(&host, &header);
 					}

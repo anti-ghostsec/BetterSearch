@@ -96,10 +96,11 @@ Tick it and a stale cookie is refreshed by itself before a search.
 
 Wisp keeps its session in memory by default; turn on **Persistent profile** in
 its menu, load the site, and its WebKit cookie store is read like a Firefox
-profile. Otherwise paste. `cf_clearance` usually lasts hours, not days. Cloudflare ties it to the browser's
-User-Agent, so the app sends a Firefox one on hosts it holds a cookie for
-instead of its own; if the browser's version differs a lot the cookie can still
-be refused, in which case paste again.
+profile. Otherwise paste. `cf_clearance` usually lasts hours, not days, and Cloudflare ties it to the
+User-Agent of whoever earned it — so the UA is stored with the cookie and sent
+with it: the browser's own for a Wisp or Firefox find, a Firefox one for a
+pasted cookie. If the two don't match the site refuses it and it has to be
+pasted again.
 
 With automatic reading on, a stored cookie over ten minutes old is refreshed
 again before a search, so it keeps working without you doing anything. Paheal answers HTML rather than its API.

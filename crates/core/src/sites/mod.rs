@@ -133,18 +133,24 @@ pub trait Site: Send + Sync {
 /// no browser, so it borrows the one that's already there: the visitor passes
 /// it once in LibreWolf or Firefox and the clearance is copied out of that
 /// profile's cookie database into the vault. Kept in memory here.
-static JAR: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+type Jar = std::sync::RwLock<std::collections::HashMap<String, (String, String)>>;
+static JAR: std::sync::OnceLock<Jar> = std::sync::OnceLock::new();
 
-fn jar() -> &'static std::sync::RwLock<std::collections::HashMap<String, String>> {
+fn jar() -> &'static Jar {
 	JAR.get_or_init(Default::default)
 }
 
 pub fn set_cookie(host: &str, header: &str) {
+	set_cookie_as(host, header, firefox_ua());
+}
+
+/// The UA a cookie was earned under has to go with it, or the site refuses it.
+pub fn set_cookie_as(host: &str, header: &str, ua: &str) {
 	let host = host.trim().trim_start_matches('.').to_lowercase();
 	if host.is_empty() || header.trim().is_empty() {
 		return;
 	}
-	jar().write().unwrap_or_else(|e| e.into_inner()).insert(host, header.trim().to_string());
+	jar().write().unwrap_or_else(|e| e.into_inner()).insert(host, (header.trim().to_string(), ua.trim().to_string()));
 }
 
 pub fn clear_cookies() {
@@ -165,7 +171,7 @@ pub fn host_of(url: &str) -> Option<&str> {
 }
 
 /// The longest stored cookie host that `url` belongs to (`bo.ru` or `a.bo.ru`).
-pub fn cookie_for(url: &str) -> Option<String> {
+pub fn cookie_for(url: &str) -> Option<(String, String)> {
 	let host = host_of(url)?.to_lowercase();
 	let jar = jar().read().unwrap_or_else(|e| e.into_inner());
 	jar.iter()
@@ -176,13 +182,18 @@ pub fn cookie_for(url: &str) -> Option<String> {
 
 /// The UA a clearance cookie was earned under. Cloudflare ties `cf_clearance`
 /// to it, so a cookie sent with the app's own UA is refused.
-const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
+/// The Firefox UA used when nothing better is known.
+pub fn firefox_ua() -> &'static str {
+	BROWSER_UA
+}
+
+pub const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
 
 /// Attaches the borrowed cookie, if there is one for this host, and the
 /// matching UA. Sites without a cookie keep the app's own UA.
 pub fn with_cookie(req: reqwest::blocking::RequestBuilder, url: &str) -> reqwest::blocking::RequestBuilder {
 	match cookie_for(url) {
-		Some(cookie) => req.header(reqwest::header::COOKIE, cookie).header(reqwest::header::USER_AGENT, BROWSER_UA),
+		Some((cookie, ua)) => req.header(reqwest::header::COOKIE, cookie).header(reqwest::header::USER_AGENT, ua),
 		None => req,
 	}
 }
