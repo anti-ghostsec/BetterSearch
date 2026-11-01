@@ -21,7 +21,7 @@ const METAS: &[&str] = &["rating", "score", "id", "width", "height", "md5", "ord
 /// Posts per list page, the site's own number.
 const PER_PAGE: u32 = 42;
 /// Extensions tried for a file, most common first.
-const EXTS: &[&str] = &["jpg", "png", "gif", "webp", "webm", "mp4"];
+const EXTS: &[&str] = &["jpeg", "jpg", "png", "gif", "webp", "webm", "mp4"];
 /// Site rating names and what each counts as here.
 const RATINGS: &[(&str, Rating)] = &[("safe", Rating::Safe), ("questionable", Rating::Questionable), ("explicit", Rating::Explicit)];
 
@@ -105,7 +105,9 @@ impl Realbooru {
 			} else if tags.iter().any(|t| t == "video" || t == "webm" || t == "mp4") {
 				"mp4"
 			} else {
-				"jpg"
+				// Most originals are .jpeg, not .jpg; the fetch tries this first
+				// and the rest after it.
+				"jpeg"
 			};
 			out.push(Post {
 				site: "realbooru".into(),
@@ -263,9 +265,10 @@ mod tests {
 		// Spaces in tags become underscores, as boorus write them.
 		assert!(posts[0].tags.contains(&"female_fox".to_string()));
 		assert_eq!(posts[0].rating, Rating::Safe);
-		assert_eq!(posts[0].file_url.as_deref(), Some("https://realbooru.com//images/8c/3d/8c3da0a36bd70ba3c321ee374ce7e515.jpg"));
+		assert_eq!(posts[0].file_url.as_deref(), Some("https://realbooru.com//images/8c/3d/8c3da0a36bd70ba3c321ee374ce7e515.jpeg"));
+		assert_eq!(posts[0].sample_url, None, "the preview is the thumbnail; the panel must not stand in for the picture");
 		assert_eq!(posts[0].page_url, "https://realbooru.com/index.php?page=post&s=view&id=645546");
-		assert_eq!(posts[1].file_url.as_deref(), Some("https://realbooru.com//images/aa/bb/aa11bb22cc33dd44ee55ff6677889900.jpg"));
+		assert_eq!(posts[1].file_url.as_deref(), Some("https://realbooru.com//images/aa/bb/aa11bb22cc33dd44ee55ff6677889900.jpeg"));
 	}
 
 	#[test]

@@ -42,10 +42,11 @@ and which family to pick, without changing anything.
 
 ## Taste
 
-Off by default. When on, a **Taste** tab opens: chat with a guide that knows
-your tags and can answer with a search to run, ask it for picks, or have it
-write a brief in your settings. The model list is fetched from the endpoint, so
-nothing has to be typed from memory.
+Off by default. When on, a **Guide** appears at the top of the left panel: chat
+with it, and it answers knowing your tags, your brief and the searches you've
+already run, so it doesn't send you round the same one again. Ask for picks and
+it searches your own tags without a model. The model list is fetched from the
+endpoint, so nothing has to be typed from memory.
 
 **What leaves the machine, and that's all:** the top 40 weighted tags, and the
 ratings you have ticked if "send the ratings I tick" is left on. No pictures,

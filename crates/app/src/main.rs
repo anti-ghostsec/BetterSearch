@@ -112,8 +112,6 @@ enum Action {
 	View(usize),
 	/// Writes the post's real file to the downloads folder.
 	Save(usize),
-	/// Switches between the results grid and the Taste tab.
-	TasteTab(bool),
 	CloseViewer,
 	/// Moves to the post this many places on (the one shown large, or selected).
 	Step(i64),
@@ -178,7 +176,7 @@ struct App {
 	file_note: Option<String>,
 	brief_calls: Vec<std::time::Instant>,
 	save_dialog: Option<SaveDialog>,
-	taste_tab: bool,
+	models_asked: bool,
 	/// Thumbnails allowed to start this frame, so a whole page doesn't decode
 	/// and upload in one go.
 	thumb_budget: usize,
@@ -290,7 +288,7 @@ impl App {
 			file_note: None,
 			brief_calls: Vec::new(),
 			save_dialog: None,
-			taste_tab: false,
+			models_asked: false,
 			thumb_budget: 16,
 			chat: Vec::new(),
 			chat_input: String::new(),
@@ -370,25 +368,33 @@ impl App {
 			taste::build(&store, &self.settings.ratings, now, self.settings.taste.dial_override).ok()
 		};
 		let tags: Vec<String> = profile.as_ref().map(|p| p.tags.iter().take(30).map(|t| t.tag.clone()).collect()).unwrap_or_default();
+		let recent: Vec<String> = self
+			.store
+			.lock()
+			.map(|s| s.history(12).unwrap_or_default().into_iter().map(|(q, _)| q).collect())
+			.unwrap_or_default();
 		let system = format!(
 			"You guide someone through booru searching. Their taste, from their own favorites and searches: {}. Their brief: {}. \
+			 Their recent searches, newest first: [{}]. Don't send them on a search they've already run unless they ask for it again. \
 			 Answer briefly, in plain prose. If a search would help, end with one last line exactly `SEARCH: <query>` using boolean \
 			 syntax (tags ANDed by spaces, `~a ~b` for either, `-tag`, `rating:s|q|e`, `order:score`). Only real tag names.",
 			if tags.is_empty() { "not known yet".to_string() } else { tags.join(", ") },
 			if self.taste_brief.is_empty() { "none yet".to_string() } else { self.taste_brief.clone() },
+			recent.join("; "),
 		);
 		let t = &self.settings.taste;
 		self.worker.chat(t.endpoint.clone(), t.api_key.clone(), t.model.clone(), system, text);
 	}
 
-	/// The Taste tab: chat with a guide, and the brief.
-	fn taste_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+	/// The guide, in the side panel: chat, brief and picks.
+	fn guide(&mut self, ui: &mut egui::Ui) {
+		if !self.models_asked && self.models.is_empty() && !self.settings.taste.endpoint.is_empty() {
+			self.models_asked = true;
+			let t = &self.settings.taste;
+			self.worker.models(t.endpoint.clone(), t.api_key.clone());
+		}
 		ui.horizontal(|ui| {
-			if ui.button("◀ Results").clicked() {
-				actions.push(Action::TasteTab(false));
-			}
-			ui.separator();
-			ui.label("Model");
+			ui.strong("Guide");
 			let current = if self.settings.taste.model.is_empty() { "pick one".to_string() } else { self.settings.taste.model.clone() };
 			egui::ComboBox::from_id_salt("taste-model").selected_text(current).show_ui(ui, |ui| {
 				for m in self.models.clone() {
@@ -406,7 +412,6 @@ impl App {
 			ui.separator();
 			if ui.button("Picks").on_hover_text("Searches built from your own tags, no model involved").clicked() {
 				self.refresh_picks();
-				actions.push(Action::TasteTab(false));
 			}
 			if ui.button("New brief").clicked() {
 				self.write_brief();
@@ -418,8 +423,7 @@ impl App {
 		if !self.taste_brief.is_empty() {
 			ui.group(|ui| ui.label(RichText::new(&self.taste_brief).italics()));
 		}
-		let room = ui.available_height() - 34.0;
-		egui::ScrollArea::vertical().max_height(room.max(80.0)).stick_to_bottom(true).show(ui, |ui| {
+		egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).show(ui, |ui| {
 			if self.chat.is_empty() {
 				ui.label(RichText::new("Say what you're after — \"something with wolves at night\", \"less comic, more solo\" — and it will point a search at it.").weak());
 			}
@@ -748,7 +752,6 @@ impl App {
 						if let Some(q) = text.lines().rev().find_map(|l| l.trim().strip_prefix("SEARCH:")) {
 							self.query = q.trim().trim_matches('`').to_string();
 							self.search();
-							self.taste_tab = false;
 						}
 					}
 					Err(e) => self.chat.push((false, format!("({e})"))),
@@ -1084,7 +1087,6 @@ impl App {
 					}
 				}
 				Action::Save(i) => self.save_post(i),
-				Action::TasteTab(on) => self.taste_tab = on,
 				Action::VoteTag(..)
 				| Action::AddLink
 				| Action::RemoveLink(_)
@@ -1197,16 +1199,14 @@ impl App {
 				if ui.button("♥").on_hover_text("Your favorites (kept on this computer)").clicked() {
 					actions.push(Action::ShowFavorites);
 				}
-				if self.settings.taste.enabled {
-					let on = self.taste_tab;
-					if ui.selectable_label(on, "Taste").on_hover_text("Chat with a guide, and picks from what you like").clicked() {
-						actions.push(Action::TasteTab(!on));
-						if !on && self.models.is_empty() {
-							let t = &self.settings.taste;
-							self.worker.models(t.endpoint.clone(), t.api_key.clone());
-						}
-					}
+				if self.settings.taste.enabled
+					&& !self.settings.show_tags
+					&& ui.button("Guide").on_hover_text("The AI guide lives in the left panel").clicked()
+				{
+					self.settings.show_tags = true;
+					self.save_settings();
 				}
+
 				if ui.add_enabled(!self.query.trim().is_empty(), egui::Button::new("☆ Save")).on_hover_text("Save this search").clicked() {
 					actions.push(Action::OpenSave);
 				}
@@ -1444,7 +1444,7 @@ impl App {
 		egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
 			let video = matches!(post.ext.as_str(), "webm" | "mp4" | "swf");
 			let animated = video || post.ext == "gif";
-			let url = post.sample_url.clone().or(post.preview_url.clone());
+			let url = post.file_url.clone().or(post.sample_url.clone()).or(post.preview_url.clone());
 			if !self.site_shows(&post.site) {
 				ui.label(
 					RichText::new(format!(
@@ -1464,7 +1464,27 @@ impl App {
 			} else if let Some(t) = url.as_deref().and_then(|u| self.big_texture(&post.site, u)) {
 				let w = ui.available_width();
 				let size = t.size_vec2();
-				ui.add(egui::Image::from_texture(&t).fit_to_exact_size(Vec2::new(w, size.y * w / size.x)));
+				let pic = ui.add(egui::Image::from_texture(&t).fit_to_exact_size(Vec2::new(w, size.y * w / size.x)).sense(Sense::click()));
+				pic.context_menu(|ui| {
+					if ui.button("Save file…").clicked()
+						&& let Some(i) = self.selected
+					{
+						actions.push(Action::Save(i));
+					}
+					if ui.button("Open page").clicked() {
+						actions.push(Action::Open(post.page_url.clone()));
+					}
+					if ui.button("View large").clicked()
+						&& let Some(i) = self.selected
+					{
+						actions.push(Action::View(i));
+					}
+					if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked()
+						&& let Some(i) = self.selected
+					{
+						actions.push(Action::ToggleFavorite(i));
+					}
+				});
 			} else if url.is_some() {
 				ui.spinner();
 			}
@@ -1779,17 +1799,28 @@ impl App {
 		match self.big_texture(&post.site, &url) {
 			Some(t) => {
 				let size = t.size_vec2();
-				if self.viewer_actual {
+				let pic = if self.viewer_actual {
 					egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-						ui.add(egui::Image::from_texture(&t).fit_to_exact_size(size));
-					});
+						ui.add(egui::Image::from_texture(&t).fit_to_exact_size(size)).interact(Sense::click())
+					}).inner
 				} else {
 					let room = ui.available_size();
 					let scale = (room.x / size.x).min(room.y / size.y).min(3.0);
 					ui.centered_and_justified(|ui| {
-						ui.add(egui::Image::from_texture(&t).fit_to_exact_size(size * scale));
-					});
-				}
+						ui.add(egui::Image::from_texture(&t).fit_to_exact_size(size * scale)).interact(Sense::click())
+					}).inner
+				};
+				pic.context_menu(|ui| {
+					if ui.button("Save file…").clicked() {
+						actions.push(Action::Save(i));
+					}
+					if ui.button("Open page").clicked() {
+						actions.push(Action::Open(post.page_url.clone()));
+					}
+					if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked() {
+						actions.push(Action::ToggleFavorite(i));
+					}
+				});
 			}
 			None => {
 				ui.centered_and_justified(|ui| ui.spinner());
@@ -2545,13 +2576,17 @@ impl App {
 		} else {
 		if self.settings.show_tags {
 			egui::Panel::left("tags").resizable(true).default_size(250.0).min_size(180.0).max_size(420.0).show(ui, |ui| {
+				if self.settings.taste.enabled {
+					self.guide(ui);
+					ui.separator();
+				}
 				self.hover_tag = self.tags.show(ui, &self.query, &self.posts, self.asked.as_ref(), self.generation, &self.store, &mut actions);
 			});
 		}
 		if self.selected.is_some() {
 			egui::Panel::right("detail").resizable(true).default_size(380.0).min_size(260.0).show(ui, |ui| self.detail(ui, &mut actions));
 		}
-		egui::CentralPanel::default().show(ui, |ui| if self.taste_tab { self.taste_view(ui, &mut actions) } else { self.grid(ui, &mut actions) });
+		egui::CentralPanel::default().show(ui, |ui| self.grid(ui, &mut actions));
 		}
 		self.settings_window(&ctx);
 		self.save_as_window(&ctx);
