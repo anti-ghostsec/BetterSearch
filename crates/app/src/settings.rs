@@ -47,6 +47,7 @@ pub struct Settings {
 	/// Boorus you added yourself.
 	pub custom_sites: Vec<CustomSite>,
 	/// Reuse the browser's clearance cookies for sites that challenge the app.
+	/// Off by default: the app then touches no browser files at all.
 	pub browser_cookies: bool,
 }
 
@@ -179,7 +180,7 @@ impl Default for Settings {
 			taste: Taste::default(),
 			api: Api::default(),
 			custom_sites: Vec::new(),
-			browser_cookies: true,
+			browser_cookies: false,
 		}
 	}
 }

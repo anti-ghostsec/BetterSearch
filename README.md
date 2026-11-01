@@ -80,15 +80,18 @@ LibreWolf profile, or paste the `Cookie` header yourself. The cookie is kept in
 the vault and sent to that host only, and searches work from then on until it
 expires.
 
+**Reading the browser is off by default** — with the box unticked the app opens
+no browser files at all, and cookies come only from the button or a paste.
+Tick it and a stale cookie is refreshed by itself before a search.
+
 Wisp keeps its session in memory, so there is no file to read — paste is the
 way for it. `cf_clearance` usually lasts hours, not days. Cloudflare ties it to the browser's
 User-Agent, so the app sends a Firefox one on hosts it holds a cookie for
 instead of its own; if the browser's version differs a lot the cookie can still
 be refused, in which case paste again.
 
-The app copies clearance cookies by itself for the sites it is about to search
-when a stored one is over ten minutes old, so a working cookie keeps working
-without you doing anything. Paheal answers HTML rather than its API.
+With automatic reading on, a stored cookie over ten minutes old is refreshed
+again before a search, so it keeps working without you doing anything. Paheal answers HTML rather than its API.
 
 On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
 `safe`), and `sensitive` counts as *Questionable*. Danbooru's 2-tag limit

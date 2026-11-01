@@ -2144,7 +2144,7 @@ impl App {
 				.weak(),
 			);
 			let mut borrow = self.settings.browser_cookies;
-			if ui.checkbox(&mut borrow, "Use my browser's cookies").changed() {
+			if ui.checkbox(&mut borrow, "Read my browser's cookies automatically").on_hover_text("Off by default, so the app opens no browser files unless you ask").changed() {
 				self.settings.browser_cookies = borrow;
 				self.save_settings();
 			}
@@ -2168,7 +2168,7 @@ impl App {
 					}
 				}
 			});
-			if ui.button("Copy cookies now").on_hover_text("Needs a Firefox or LibreWolf profile on this computer").clicked() {
+			if ui.button("Copy cookies now").on_hover_text("Works whether or not the box above is ticked; needs a Firefox or LibreWolf profile").clicked() {
 				let hosts: Vec<String> = self.current_sites().iter().map(|s| cookies::host_of(s.base())).filter(|h| !h.is_empty()).collect();
 				let mut got = 0;
 				for (host, header, _) in cookies::harvest(&hosts) {
