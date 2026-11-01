@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# A re-pushed tag cancels its own earlier build instead of racing it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     runs-on: ubuntu-latest
