@@ -200,6 +200,15 @@ apply after translating (e621 turns `wolf_ears` into `ears` on its own).
   the bar seeks; videos loop. ffmpeg may only read that one file
   (`-protocol_whitelist file`), so a crafted video can't make it fetch
   anything. Needs `ffmpeg` installed; without it, "Open file" plays elsewhere.
+- **Ticking posts**: the box at a thumbnail's top right (or Ctrl+click) ticks
+  it, and a bar above the results acts on every ticked post at once:
+  **↓ Download** saves each full file to the folder you last saved to
+  (Downloads/BetterSearch at first), **♥ Favorite** adds them all (♡ takes them
+  back out), and **Share** opens the FerroOS share box. One file goes to it
+  straight from memory; several are saved like Download first, since the box
+  takes several only as files. Share only shows on FerroOS, where
+  `/usr/local/bin/ferro-share` exists. Right-click and the post panel still
+  have their own Save file….
 - **Tags in the post panel**: click to add one to the search, click again to
   take it out; − leaves it out. ✓ and ⊘ show what the search does with it.
 - **Find similar** (post panel): posts sharing the most *telling* tags with

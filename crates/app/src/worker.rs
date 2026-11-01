@@ -2,12 +2,14 @@
 // searches, one answers autocomplete (latest request wins), and a few fetch
 // and decode thumbnails. Results come back as `Msg`s.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use bettersearch_core::search::AskedHere;
 
 use crate::media::{self, Video};
+use crate::share;
 use bettersearch_core::{MultiSearch, Post, Rating, Site, Store, TagSuggestion};
 use eframe::egui::{self, ColorImage};
 
@@ -42,6 +44,8 @@ pub enum Msg {
 	Brief(Result<String, String>),
 	/// A file was written to disk, or why it wasn't.
 	Saved { site: String, id: u64, path: String, error: Option<String> },
+	/// How downloading or sharing the ticked posts is going, or how it went.
+	Ticked(String),
 }
 
 pub struct Worker {
@@ -172,23 +176,82 @@ impl Worker {
 		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
 		std::thread::spawn(move || {
 			let (site_id, id) = (post.site.clone(), post.id);
-			let url = post.file_url.clone().or(post.sample_url.clone()).or(post.preview_url.clone());
 			let mut path = String::new();
 			let mut error = None;
-			match url {
-				None => error = Some("the site sent no file for this post".to_string()),
-				Some(url) => {
-					match site.fetch_bytes(&url) {
-						Err(e) => error = Some(e.to_string()),
-						Ok(bytes) => match std::fs::write(&dest, &bytes) {
-							Ok(()) => path = dest.display().to_string(),
-							Err(e) => error = Some(e.to_string()),
-						},
-					}
-				}
+			match fetch_file(site.as_ref(), &post) {
+				Err(e) => error = Some(e),
+				Ok(bytes) => match std::fs::write(&dest, &bytes) {
+					Ok(()) => path = dest.display().to_string(),
+					Err(e) => error = Some(e.to_string()),
+				},
 			}
 			let _ = tx.send(Msg::Saved { site: site_id, id, path, error });
 			ctx.request_repaint();
+		});
+	}
+
+	/// Each post's real file, one after another, into `dir` under its plain
+	/// name; with a share tool, then offered to the share box all together.
+	pub fn download(&self, posts: Vec<(Arc<dyn Site>, Post)>, dir: PathBuf, share: Option<PathBuf>) {
+		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+		std::thread::spawn(move || {
+			let say = |m: String| {
+				let _ = tx.send(Msg::Ticked(m));
+				ctx.request_repaint();
+			};
+			if let Err(e) = std::fs::create_dir_all(&dir) {
+				say(format!("Couldn't make {}: {e}", dir.display()));
+				return;
+			}
+			let n = posts.len();
+			let (mut paths, mut failed) = (Vec::new(), Vec::new());
+			for (k, (site, post)) in posts.into_iter().enumerate() {
+				say(format!("Saving {} of {n}…", k + 1));
+				let written = fetch_file(site.as_ref(), &post).and_then(|bytes| {
+					let path = dir.join(share::file_name(&post, Some(&bytes)));
+					std::fs::write(&path, &bytes).map(|()| path).map_err(|e| e.to_string())
+				});
+				match written {
+					Ok(path) => paths.push(path),
+					Err(e) => failed.push(format!("{} #{}: {e}", post.site, post.id)),
+				}
+			}
+			let mut note = if failed.is_empty() {
+				format!("Saved {n} {} to {}.", if n == 1 { "file" } else { "files" }, dir.display())
+			} else {
+				format!("Saved {} of {n} to {}. Not saved: {}.", paths.len(), dir.display(), failed.join("; "))
+			};
+			if let Some(tool) = share
+				&& !paths.is_empty()
+			{
+				note.push_str(&match share::files(&tool, &paths) {
+					Ok(()) => " The share box has them.".to_string(),
+					Err(e) => format!(" The share box didn't open: {e}."),
+				});
+			}
+			say(note);
+		});
+	}
+
+	/// One post's file, fetched into memory and handed to the share box.
+	pub fn share(&self, site: Arc<dyn Site>, post: Post, tool: PathBuf) {
+		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+		std::thread::spawn(move || {
+			let say = |m: String| {
+				let _ = tx.send(Msg::Ticked(m));
+				ctx.request_repaint();
+			};
+			let note = match fetch_file(site.as_ref(), &post) {
+				Ok(bytes) => {
+					let name = share::file_name(&post, Some(&bytes));
+					match share::bytes(&tool, &name, bytes) {
+						Ok(()) => format!("The share box has {name}."),
+						Err(e) => format!("The share box didn't open: {e}."),
+					}
+				}
+				Err(e) => format!("Couldn't fetch #{}: {e}.", post.id),
+			};
+			say(note);
 		});
 	}
 
@@ -336,6 +399,12 @@ fn similar(site: &dyn Site, post: &Post, ratings: &[Rating], versions: bool, sto
 		Ok(Err(e)) => send(Msg::Failed { generation, error: e }),
 		Err(e) => send(Msg::Failed { generation, error: e.to_string() }),
 	}
+}
+
+/// The post's real file, or the biggest version the site sent.
+fn fetch_file(site: &dyn Site, post: &Post) -> Result<Vec<u8>, String> {
+	let url = post.file_url.as_ref().or(post.sample_url.as_ref()).or(post.preview_url.as_ref()).ok_or("the site sent no file for this post")?;
+	site.fetch_bytes(url).map_err(|e| e.to_string())
 }
 
 fn decode(bytes: &[u8]) -> Result<ColorImage, String> {

@@ -9,6 +9,7 @@ mod groups;
 mod lock;
 mod media;
 mod settings;
+mod share;
 mod tags_panel;
 mod translations;
 mod vault;
@@ -112,6 +113,16 @@ enum Action {
 	View(usize),
 	/// Writes the post's real file to the downloads folder.
 	Save(usize),
+	/// Ticks a post, or unticks it.
+	Tick(usize),
+	TickAll,
+	ClearTicks,
+	/// Saves every ticked post's file, no questions asked.
+	DownloadTicked,
+	/// Adds every ticked post to favorites, or (false) takes them out.
+	FavoriteTicked(bool),
+	/// Hands the ticked posts' files to the share box.
+	ShareTicked,
 	CloseViewer,
 	/// Moves to the post this many places on (the one shown large, or selected).
 	Step(i64),
@@ -174,6 +185,14 @@ struct App {
 	taste_brief: String,
 	taste_note: Option<String>,
 	file_note: Option<String>,
+	/// Posts ticked in the grid, by key, for doing one thing to all of them.
+	ticked: HashSet<String>,
+	/// How the last thing done to the ticked posts went.
+	tick_note: Option<String>,
+	/// The folder the last file was saved to, where ticked posts go too.
+	save_dir: Option<std::path::PathBuf>,
+	/// The FerroOS share box; without one, no Share button.
+	share_tool: Option<std::path::PathBuf>,
 	brief_calls: Vec<std::time::Instant>,
 	save_dialog: Option<SaveDialog>,
 	models_asked: bool,
@@ -286,6 +305,10 @@ impl App {
 			taste_brief,
 			taste_note: None,
 			file_note: None,
+			ticked: HashSet::new(),
+			tick_note: None,
+			save_dir: None,
+			share_tool: share::tool(),
 			brief_calls: Vec::new(),
 			save_dialog: None,
 			models_asked: false,
@@ -480,19 +503,24 @@ impl App {
 		}
 	}
 
+	/// Where files go: the folder saved to last, or Downloads/BetterSearch.
+	fn download_dir(&self) -> std::path::PathBuf {
+		self.save_dir.clone().unwrap_or_else(|| dirs::download_dir().or_else(dirs::picture_dir).unwrap_or_else(settings::data_dir).join("BetterSearch"))
+	}
+
 	/// Opens the save dialog for a post, suggesting a name and folder.
 	fn save_post(&mut self, i: usize) {
 		let Some(post) = self.posts.get(i) else { return };
-		let dir = dirs::download_dir()
-			.or_else(dirs::picture_dir)
-			.unwrap_or_else(settings::data_dir)
-			.join("BetterSearch");
-		self.save_dialog = Some(SaveDialog {
-			i,
-			dir,
-			name: format!("{}_{}.{}", post.site, post.id, post.ext),
-			error: None,
-		});
+		self.save_dialog = Some(SaveDialog { i, dir: self.download_dir(), name: share::file_name(post, None), error: None });
+	}
+
+	/// The ticked posts in grid order, with their sites.
+	fn ticked_posts(&self) -> Vec<(Arc<dyn Site>, Post)> {
+		self.posts
+			.iter()
+			.filter(|p| self.ticked.contains(&p.key()))
+			.filter_map(|p| self.site_by_id(&p.site).map(|s| (s, p.clone())))
+			.collect()
 	}
 
 	/// Writes the chosen file where the dialog says.
@@ -507,8 +535,9 @@ impl App {
 			self.file_note = Some(e.to_string());
 			return;
 		}
-		let name = if d.name.trim().is_empty() { format!("{}_{}.{}", post.site, post.id, post.ext) } else { d.name.trim().to_string() };
+		let name = if d.name.trim().is_empty() { share::file_name(&post, None) } else { d.name.trim().to_string() };
 		self.file_note = Some(format!("Saving {}…", name));
+		self.save_dir = Some(d.dir.clone());
 		self.worker.save(site, post, d.dir.join(name));
 	}
 
@@ -689,6 +718,8 @@ impl App {
 		self.new_after.clear();
 		self.asked = None;
 		self.posts.clear();
+		self.ticked.clear();
+		self.tick_note = None;
 		self.selected = None;
 		self.detail = None;
 		self.error = None;
@@ -810,6 +841,7 @@ impl App {
 						None => format!("Saved {path}"),
 					});
 				}
+				Msg::Ticked(note) => self.tick_note = Some(note),
 				Msg::Image { url, image } => {
 					let tex = match image {
 						Ok(img) => Tex::Ready(ctx.load_texture(&url, img, egui::TextureOptions::LINEAR)),
@@ -1123,6 +1155,55 @@ impl App {
 					}
 				}
 				Action::Save(i) => self.save_post(i),
+				Action::Tick(i) => {
+					if let Some(key) = self.posts.get(i).map(Post::key)
+						&& !self.ticked.remove(&key)
+					{
+						self.ticked.insert(key);
+					}
+				}
+				Action::TickAll => self.ticked = (0..self.posts.len()).filter(|&i| self.visible(i)).map(|i| self.posts[i].key()).collect(),
+				Action::ClearTicks => {
+					self.ticked.clear();
+					self.tick_note = None;
+				}
+				Action::DownloadTicked => {
+					let posts = self.ticked_posts();
+					self.tick_note = Some(format!("Saving {} files…", posts.len()));
+					self.worker.download(posts, self.download_dir(), None);
+				}
+				Action::FavoriteTicked(on) => {
+					for (_, post) in self.ticked_posts() {
+						let key = post.key();
+						if self.favorites.contains(&key) == on {
+							continue;
+						}
+						match self.store.lock().unwrap().set_favorite(&post, on) {
+							Ok(()) if on => {
+								self.favorites.insert(key);
+							}
+							Ok(()) => {
+								self.favorites.remove(&key);
+							}
+							Err(e) => self.error = Some(e.to_string()),
+						}
+					}
+					self.urgent = true;
+				}
+				Action::ShareTicked => {
+					let Some(tool) = self.share_tool.clone() else { continue };
+					let mut posts = self.ticked_posts();
+					// One file goes straight from memory. The box takes several only
+					// as files, so those are saved first, as Download would.
+					if posts.len() == 1 {
+						let (site, post) = posts.remove(0);
+						self.tick_note = Some(format!("Fetching #{} to share…", post.id));
+						self.worker.share(site, post, tool);
+					} else if !posts.is_empty() {
+						self.tick_note = Some(format!("Saving {} files to share…", posts.len()));
+						self.worker.download(posts, self.download_dir(), Some(tool));
+					}
+				}
 				Action::VoteTag(..)
 				| Action::AddLink
 				| Action::RemoveLink(_)
@@ -1333,6 +1414,9 @@ impl App {
 			});
 			return;
 		}
+		if !self.ticked.is_empty() || self.tick_note.is_some() {
+			self.ticked_bar(ui, actions);
+		}
 		egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
 			self.grid_cols = ((ui.available_width() + 6.0) / (THUMB + 6.0)).floor().max(1.0) as usize;
 			self.grid_rows = (ui.available_height() / (THUMB + 6.0)).ceil().max(1.0) as usize;
@@ -1400,7 +1484,8 @@ impl App {
 						painter.rect_filled(rect, 4.0, Color32::from_black_alpha(190));
 					}
 					if self.new_after.get(&p.site).is_some_and(|seen| p.id > *seen) {
-						let badge = egui::Rect::from_min_size(rect.right_top() + Vec2::new(-44.0, 6.0), Vec2::new(38.0, 18.0));
+						// Left of the tick box.
+						let badge = egui::Rect::from_min_size(rect.right_top() + Vec2::new(-72.0, 8.0), Vec2::new(38.0, 18.0));
 						painter.rect_filled(badge, 4.0, Color32::from_rgb(220, 70, 90));
 						painter.text(badge.center(), egui::Align2::CENTER_CENTER, "NEW", egui::FontId::proportional(11.0), Color32::WHITE);
 					}
@@ -1416,6 +1501,30 @@ impl App {
 					if self.favorites.contains(&p.key()) {
 						painter.text(rect.left_bottom() + Vec2::new(6.0, -4.0), egui::Align2::LEFT_BOTTOM, "♥", egui::FontId::proportional(16.0), Color32::from_rgb(230, 90, 120));
 					}
+					// The tick box, top right, over the thumbnail so its clicks come first.
+					let key = p.key();
+					let ticked = self.ticked.contains(&key);
+					let tick_rect = egui::Rect::from_min_size(rect.right_top() + Vec2::new(-28.0, 6.0), Vec2::splat(22.0));
+					let tick = ui.interact(tick_rect, ui.scope_id().with(("tick", &key)), Sense::click()).on_hover_text(if self.share_tool.is_some() {
+						"Tick, to download, favorite or share several at once"
+					} else {
+						"Tick, to download or favorite several at once"
+					});
+					let (fill, line) = if ticked {
+						(ui.visuals().selection.bg_fill, Color32::WHITE)
+					} else if tick.hovered() {
+						(Color32::from_black_alpha(170), Color32::WHITE)
+					} else {
+						(Color32::from_black_alpha(110), Color32::from_white_alpha(170))
+					};
+					painter.rect_filled(tick_rect, 4.0, fill);
+					painter.rect_stroke(tick_rect, 4.0, egui::Stroke::new(1.5, line), egui::StrokeKind::Inside);
+					if ticked {
+						painter.text(tick_rect.center(), egui::Align2::CENTER_CENTER, "✓", egui::FontId::proportional(16.0), Color32::WHITE);
+					}
+					if tick.clicked() {
+						actions.push(Action::Tick(i));
+					}
 					if self.selected == Some(i) {
 						if self.scroll_to_selected {
 							ui.scroll_to_rect(rect, None);
@@ -1428,6 +1537,8 @@ impl App {
 					let response = response.on_hover_text(format!("#{} · score {} · {}×{}", p.id, p.score, p.width, p.height));
 					if response.double_clicked() {
 						actions.push(Action::View(i));
+					} else if response.clicked() && ui.input(|i| i.modifiers.command) {
+						actions.push(Action::Tick(i));
 					} else if response.clicked() {
 						actions.push(Action::Select(i));
 					}
@@ -1470,6 +1581,45 @@ impl App {
 			});
 			ui.add_space(12.0);
 		});
+	}
+
+	/// What can be done to all the ticked posts at once, and how the last of it went.
+	fn ticked_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+		let n = self.ticked.len();
+		let dir = self.download_dir();
+		ui.horizontal_wrapped(|ui| {
+			if n > 0 {
+				ui.strong(format!("{n} ticked"));
+				if ui.button("↓ Download").on_hover_text(format!("Saves each one's full file to {}", dir.display())).clicked() {
+					actions.push(Action::DownloadTicked);
+				}
+				let all_favorites = self.posts.iter().filter(|p| self.ticked.contains(&p.key())).all(|p| self.favorites.contains(&p.key()));
+				let (label, hover) = if all_favorites { ("♡ Unfavorite", "Takes them out of your favorites") } else { ("♥ Favorite", "Adds them to your favorites") };
+				if ui.button(label).on_hover_text(hover).clicked() {
+					actions.push(Action::FavoriteTicked(!all_favorites));
+				}
+				if self.share_tool.is_some() {
+					let hover = if n == 1 {
+						"Opens the share box with this file".to_string()
+					} else {
+						format!("Saves them to {}, then opens the share box with all of them", dir.display())
+					};
+					if ui.button("Share").on_hover_text(hover).clicked() {
+						actions.push(Action::ShareTicked);
+					}
+				}
+				if ui.button("Tick all").clicked() {
+					actions.push(Action::TickAll);
+				}
+				if ui.button("Clear").on_hover_text("Untick them all").clicked() {
+					actions.push(Action::ClearTicks);
+				}
+			}
+			if let Some(note) = &self.tick_note {
+				ui.label(RichText::new(note).weak());
+			}
+		});
+		ui.separator();
 	}
 
 	fn detail(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -2872,6 +3022,123 @@ mod tests {
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
+	/// Stands in for e926: every file is a few bytes of PNG.
+	struct Files;
+
+	impl bettersearch_core::Site for Files {
+		fn id(&self) -> &str {
+			"e926"
+		}
+		fn base(&self) -> &str {
+			"https://example.invalid"
+		}
+		fn name(&self) -> &str {
+			"e926"
+		}
+		fn caps(&self) -> bettersearch_core::sites::Capabilities {
+			bettersearch_core::sites::Capabilities { max_tags: 6, tilde_or: true, max_wildcards: 1, metas: &[], free_metas: &[], page_size: 60 }
+		}
+		fn search(&self, _: &str, _: Option<bettersearch_core::sites::Cursor>, _: usize) -> bettersearch_core::Result<bettersearch_core::sites::Page> {
+			Ok(bettersearch_core::sites::Page { posts: Vec::new(), next: None })
+		}
+		fn tag_counts(&self, _: &[String]) -> bettersearch_core::Result<std::collections::HashMap<String, u64>> {
+			Ok(Default::default())
+		}
+		fn aliases(&self, _: &[String]) -> bettersearch_core::Result<std::collections::HashMap<String, String>> {
+			Ok(Default::default())
+		}
+		fn autocomplete(&self, _: &str) -> bettersearch_core::Result<Vec<bettersearch_core::TagSuggestion>> {
+			Ok(Vec::new())
+		}
+		fn fetch_bytes(&self, url: &str) -> bettersearch_core::Result<Vec<u8>> {
+			Ok([b"\x89PNG\r\n\x1a\n".as_slice(), url.as_bytes()].concat())
+		}
+	}
+
+	/// Frames until the ticked posts' note says it's finished.
+	fn tick_note(app: &mut super::App, ctx: &egui::Context) -> String {
+		for _ in 0..200 {
+			texts(app, ctx, 1300.0);
+			if let Some(n) = app.tick_note.clone().filter(|n| !n.ends_with('…')) {
+				return n;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(20));
+		}
+		panic!("still {:?}", app.tick_note);
+	}
+
+	fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+		egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+	}
+
+	/// The box on a thumbnail ticks it without selecting it; ticked posts get a
+	/// bar, with Share only where the share box is.
+	#[test]
+	fn ticking_posts() {
+		let (mut app, ctx, dir) = app_with_posts("tick", 4);
+		app.share_tool = None;
+		let shown = |app: &mut super::App| texts(app, &ctx, 1300.0).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+		let seen = texts(&mut app, &ctx, 1300.0);
+		assert!(!seen.iter().any(|(t, _)| t.ends_with("ticked")));
+		// The first thumbnail's "…" sits at its middle; its box is at the top right.
+		let middle = seen.iter().find(|(t, _)| t == "…").unwrap().1.center();
+		let corner = middle + egui::vec2(super::THUMB / 2.0 - 17.0, -super::THUMB / 2.0 + 17.0);
+		texts_with(&mut app, &ctx, 1300.0, vec![egui::Event::PointerMoved(corner)]);
+		texts_with(&mut app, &ctx, 1300.0, vec![pointer(corner, true)]);
+		texts_with(&mut app, &ctx, 1300.0, vec![pointer(corner, false)]);
+		assert!(app.ticked.contains(&app.posts[0].key()), "{:?}", app.ticked);
+		assert_eq!(app.selected, None);
+		app.apply(vec![super::Action::Tick(2)]);
+		let bar = shown(&mut app);
+		for want in ["2 ticked", "↓ Download", "♥ Favorite", "Tick all", "Clear"] {
+			assert!(bar.iter().any(|t| t == want), "{want} missing from {bar:?}");
+		}
+		assert!(!bar.iter().any(|t| t == "Share"));
+		app.share_tool = Some(dir.join("ferro-share"));
+		assert!(shown(&mut app).iter().any(|t| t == "Share"));
+		// Favorite all, then the button takes them back out.
+		app.apply(vec![super::Action::FavoriteTicked(true)]);
+		assert!(app.favorites.contains(&app.posts[0].key()) && app.favorites.contains(&app.posts[2].key()));
+		assert_eq!(app.store.lock().unwrap().favorite_posts("e926").unwrap().len(), 2);
+		assert!(shown(&mut app).iter().any(|t| t == "♡ Unfavorite"));
+		app.apply(vec![super::Action::FavoriteTicked(false)]);
+		assert!(app.favorites.is_empty());
+		app.apply(vec![super::Action::TickAll]);
+		assert_eq!(app.ticked.len(), 4);
+		app.apply(vec![super::Action::ClearTicks]);
+		assert!(app.ticked.is_empty() && !shown(&mut app).iter().any(|t| t.ends_with("ticked")));
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Download writes every ticked file; Share hands one over from memory and
+	/// several as the saved files, all in one box.
+	#[test]
+	fn ticked_posts_download_and_share() {
+		let (mut app, ctx, dir) = app_with_posts("tickfiles", 3);
+		app.sites = vec![std::sync::Arc::new(Files)];
+		let out = dir.join("out");
+		app.save_dir = Some(out.clone());
+		app.apply(vec![super::Action::Tick(0), super::Action::Tick(2), super::Action::DownloadTicked]);
+		assert_eq!(tick_note(&mut app, &ctx), format!("Saved 2 files to {}.", out.display()));
+		assert!(std::fs::read(out.join("e926_1.png")).unwrap().starts_with(b"\x89PNG"));
+		assert!(out.join("e926_3.png").exists() && !out.join("e926_2.png").exists());
+
+		let tool = super::share::fake_tool(&dir);
+		app.share_tool = Some(tool);
+		app.apply(vec![super::Action::ShareTicked]);
+		assert!(tick_note(&mut app, &ctx).ends_with("The share box has them."));
+		assert_eq!(super::share::wait_for(&dir.join("args")), format!("--\n{0}/e926_1.png\n{0}/e926_3.png\n", out.display()));
+		std::fs::remove_file(dir.join("args")).unwrap();
+		std::fs::remove_file(dir.join("stdin")).unwrap();
+
+		app.apply(vec![super::Action::Tick(0)]);
+		app.apply(vec![super::Action::ShareTicked]);
+		assert_eq!(tick_note(&mut app, &ctx), "The share box has e926_3.png.");
+		assert_eq!(super::share::wait_for(&dir.join("args")), "--stdin\ne926_3.png\n");
+		assert!(super::share::wait_for(&dir.join("stdin")).ends_with("PNG\r\n\u{1a}\nhttps://example.invalid/3.png"));
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
 	/// Keys move through the grid and the large view; Esc goes back.
 	#[test]
 	fn keys_and_viewer() {
@@ -2919,15 +3186,37 @@ mod tests {
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
+	/// Points the post at an http:// address, which is never downloaded, so the
+	/// viewer's own fetch fails at once, without the network.
+	fn unfetchable(app: &mut super::App) -> String {
+		let url = "http://example.invalid/1.file".to_string();
+		app.posts[0].file_url = Some(url.clone());
+		url
+	}
+
+	/// Frames until the viewer's own fetch has failed, so it can't land after,
+	/// and undo, the file a test hands over.
+	fn until_fetch_fails(app: &mut super::App, ctx: &egui::Context) {
+		for _ in 0..200 {
+			texts(app, ctx, 1300.0);
+			if matches!(app.playing, Some(super::Playing::Failed(..))) {
+				return;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(20));
+		}
+		panic!("the viewer's fetch never came back");
+	}
+
 	/// A GIF post plays in the large view: all frames, Space pauses.
 	#[test]
 	fn gif_plays_in_the_viewer() {
 		let (mut app, ctx, dir) = app_with_posts("gif", 1);
 		app.posts[0].ext = "gif".into();
-		let url = app.posts[0].file_url.clone().unwrap();
+		let url = unfetchable(&mut app);
 		app.apply(vec![super::Action::View(0)]);
 		texts(&mut app, &ctx, 1300.0);
 		assert!(matches!(app.playing, Some(super::Playing::Loading(ref u)) if *u == url));
+		until_fetch_fails(&mut app, &ctx);
 		let frame = |shade: u8| (egui::ColorImage::new([4, 4], vec![egui::Color32::from_gray(shade); 16]), 100);
 		app.worker.inject(super::worker::Msg::Animation { url: url.clone(), frames: Ok(vec![frame(0), frame(255)]) });
 		let seen = texts(&mut app, &ctx, 1300.0);
@@ -2955,9 +3244,10 @@ mod tests {
 			.unwrap();
 		let (mut app, ctx, dir) = app_with_posts("video", 1);
 		app.posts[0].ext = "webm".into();
-		let url = app.posts[0].file_url.clone().unwrap();
+		let url = unfetchable(&mut app);
 		app.apply(vec![super::Action::View(0)]);
 		texts(&mut app, &ctx, 1300.0);
+		until_fetch_fails(&mut app, &ctx);
 		let video = super::media::Video::open(&made.stdout).map(Box::new);
 		app.worker.inject(super::worker::Msg::Video { url, video });
 		let mut seen = Vec::new();
