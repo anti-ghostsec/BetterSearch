@@ -113,7 +113,7 @@ the site as referer.
 
 | Write | Finds |
 | --- | --- |
-| `fox wolf` | both tags |
+| `fox wolf` | both tags (unless `fox_wolf` exists on the site, which wins) |
 | `-sketch` | not this tag |
 | `fox \| wolf` or `~fox ~wolf` | either |
 | `(fox \| wolf) -(sketch \| comic)` | groups, nested as deep as you like |

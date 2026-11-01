@@ -61,6 +61,69 @@ pub struct Search {
 }
 
 /// The search for the ratings ticked: one is `rating:x`, two is `-rating:y`, all three adds nothing.
+/// Adjacent plain-word pairs that could be one underscored tag.
+fn spaced_pairs(expr: &Expr) -> Vec<String> {
+	fn walk(e: &Expr, out: &mut Vec<String>) {
+		match e {
+			Expr::And(list) => {
+				for pair in list.windows(2) {
+					if let (Expr::Tag(a), Expr::Tag(b)) = (&pair[0], &pair[1])
+						&& plain(a)
+						&& plain(b)
+					{
+						out.push(format!("{a}_{b}"));
+					}
+				}
+				list.iter().for_each(|e| walk(e, out));
+			}
+			Expr::Or(list) => list.iter().for_each(|e| walk(e, out)),
+			Expr::Not(e) => walk(e, out),
+			_ => {}
+		}
+	}
+	let mut out = Vec::new();
+	walk(expr, &mut out);
+	out
+}
+
+fn plain(t: &str) -> bool {
+	!t.is_empty() && !t.contains(['_', '*', ':', '(', ')', '~'])
+}
+
+/// Rewrites pairs whose joined form the site has with at least `least` posts.
+fn join_tags(expr: Expr, counts: &HashMap<String, u64>, least: u64) -> (Expr, Vec<String>) {
+	fn go(e: Expr, counts: &HashMap<String, u64>, least: u64, made: &mut Vec<String>) -> Expr {
+		match e {
+			Expr::And(list) => {
+				let list: Vec<Expr> = list.into_iter().map(|e| go(e, counts, least, made)).collect();
+				let mut out: Vec<Expr> = Vec::with_capacity(list.len());
+				let mut i = 0;
+				while i < list.len() {
+					if i + 1 < list.len()
+						&& let (Expr::Tag(a), Expr::Tag(b)) = (&list[i], &list[i + 1])
+					{
+						let joined = format!("{a}_{b}");
+						if plain(a) && plain(b) && counts.get(&joined).is_some_and(|n| *n >= least) {
+							made.push(joined.clone());
+							out.push(Expr::Tag(joined));
+							i += 2;
+							continue;
+						}
+					}
+					out.push(list[i].clone());
+					i += 1;
+				}
+				Expr::And(out)
+			}
+			Expr::Or(list) => Expr::Or(list.into_iter().map(|e| go(e, counts, least, made)).collect()),
+			Expr::Not(inner) => Expr::Not(Box::new(go(*inner, counts, least, made))),
+			other => other,
+		}
+	}
+	let mut made = Vec::new();
+	(go(expr, counts, least, &mut made), made)
+}
+
 pub(crate) fn rating_filter(ratings: &[Rating]) -> Result<Option<Expr>> {
 	let meta = |r: Rating| Expr::Meta { key: "rating".into(), value: r.letter().to_string() };
 	let missing: Vec<Rating> = Rating::ALL.into_iter().filter(|r| !ratings.contains(r)).collect();
@@ -113,6 +176,17 @@ impl Search {
 			}
 		}
 		expr = apply_translations(&expr, &translations);
+		// "red fox" is nearly always the tag `red_fox`, typed with a space.
+		// Only joined names the site actually has are used, and the note says so.
+		let pairs = spaced_pairs(&expr);
+		if !pairs.is_empty() {
+			let counts = site.tag_counts(&pairs.iter().take(3).cloned().collect::<Vec<_>>()).unwrap_or_default();
+			let (joined, made) = join_tags(expr, &counts, 50);
+			for pair in made {
+				notes.push(format!("“{}” is searched as “{pair}”.", pair.replace('_', " ")));
+			}
+			expr = joined;
+		}
 		if let Some(r) = rating_filter(ratings)? {
 			expr = match expr {
 				Expr::And(mut es) => {
@@ -816,6 +890,39 @@ mod tests {
 		)]);
 	}
 
+
+	#[test]
+	fn spaced_words_become_a_tag_when_the_site_has_it() {
+		let expr = Expr::And(vec![Expr::Tag("red".into()), Expr::Tag("fox".into())]);
+		let counts = HashMap::from([("red_fox".to_string(), 50_000u64)]);
+		let (got, made) = join_tags(expr, &counts, 50);
+		assert_eq!(format!("{got}"), "red_fox");
+		assert_eq!(made, vec!["red_fox"]);
+	}
+
+	#[test]
+	fn a_rare_join_is_left_alone() {
+		let expr = Expr::And(vec![Expr::Tag("red".into()), Expr::Tag("fox".into())]);
+		let counts = HashMap::from([("red_fox".to_string(), 3u64)]);
+		let (got, made) = join_tags(expr, &counts, 50);
+		assert_eq!(format!("{got}"), "red fox");
+		assert!(made.is_empty());
+	}
+
+	#[test]
+	fn underscores_and_wildcards_are_never_joined() {
+		assert!(spaced_pairs(&Expr::And(vec![Expr::Tag("red_fox".into()), Expr::Tag("fox".into())])).is_empty());
+		assert!(spaced_pairs(&Expr::And(vec![Expr::Tag("red".into()), Expr::Tag("fox*".into())])).is_empty());
+		assert_eq!(spaced_pairs(&Expr::And(vec![Expr::Tag("red".into()), Expr::Tag("fox".into())])), vec!["red_fox"]);
+	}
+
+	#[test]
+	fn join_works_inside_or() {
+		let expr = Expr::Or(vec![Expr::And(vec![Expr::Tag("red".into()), Expr::Tag("fox".into())]), Expr::Tag("wolf".into())]);
+		let counts = HashMap::from([("red_fox".to_string(), 900u64)]);
+		let (got, _) = join_tags(expr, &counts, 50);
+		assert_eq!(format!("{got}"), "(red_fox) | wolf");
+	}
 
 	#[test]
 	fn saved_posts_merge_in_by_age() {
