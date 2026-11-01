@@ -52,6 +52,15 @@ fn worker() -> &'static Sender<Job> {
 		let (jobs, queue) = channel::<Job>();
 		let (ready, up) = channel::<bool>();
 		std::thread::spawn(move || {
+			// WebKit hands frames to the UI as DMA-BUFs, which comes up blank on
+			// some drivers; shared memory works everywhere. Must be set before
+			// the first WebKit use.
+			for (key, value) in [("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1"), ("WEBKIT_DISABLE_DMABUF_RENDERER", "1")] {
+				if std::env::var_os(key).is_none() {
+					// SAFETY: no GTK or WebKit object exists on this thread yet.
+					unsafe { std::env::set_var(key, value) };
+				}
+			}
 			if gtk::init().is_err() {
 				let _ = ready.send(false);
 				return;
@@ -88,7 +97,11 @@ pub fn open(host: &str) -> Option<Login> {
 fn window(job: Job) {
 	let Job { host, out } = job;
 	let session = webkit6::NetworkSession::new_ephemeral();
-	let view = webkit6::WebView::builder().network_session(&session).build();
+	let view = webkit6::WebView::builder()
+		.network_session(&session)
+		.vexpand(true)
+		.hexpand(true)
+		.build();
 	view.load_uri(&format!("https://{host}/"));
 
 	let win = gtk::Window::builder()
@@ -111,8 +124,20 @@ fn window(job: Job) {
 	bar.append(&note);
 	root.append(&view);
 	root.append(&bar);
+	root.set_vexpand(true);
 	win.set_child(Some(&root));
 	win.present();
+
+	// Say why a page didn't load instead of leaving a white rectangle.
+	// Say why a page didn't load instead of leaving a white rectangle. The
+	// window stays open: a failed image shouldn't close it.
+	{
+		let note = note.clone();
+		view.connect_load_failed(move |_, _, uri, err| {
+			note.set_text(&format!("Couldn't load {uri}: {err}"));
+			false
+		});
+	}
 
 	{
 		let out = out.clone();
