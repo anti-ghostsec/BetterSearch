@@ -124,6 +124,19 @@ impl Worker {
 	}
 
 	/// Downloads a GIF (all frames) or a video (into memory, ready to play).
+	/// Copies browser cookies for these hosts, off the UI thread.
+	pub fn harvest(&self, hosts: Vec<String>, store: Arc<Mutex<Store>>, ctx: egui::Context) {
+		std::thread::spawn(move || {
+			for (host, header, _) in crate::cookies::harvest(&hosts) {
+				bettersearch_core::sites::set_cookie(&host, &header);
+				if let Ok(s) = store.lock() {
+					let _ = s.set_cookie(&host, &header);
+				}
+			}
+			ctx.request_repaint();
+		});
+	}
+
 	/// Asks the endpoint which models it has.
 	pub fn models(&self, endpoint: String, key: String) {
 		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());

@@ -95,7 +95,9 @@ On Danbooru and Gelbooru *Safe* means `general` (plus Safebooru's old
 doesn't count rating, score, size, date, id or md5, so those always go to the
 site; other tags are sent rarest first and the rest are checked here.
 Gelbooru-style sites have no alias API and no tag categories in post answers,
-so their tags all show as general. Realbooru has no API at all: its list pages
+so their tags all show as general. Some of them (TBIB) never send file
+addresses; the folder and file name always are sent, so the addresses are
+rebuilt from those. Realbooru has no API at all: its list pages
 are read instead, and file addresses are rebuilt from the thumbnail's hash with
 the site as referer.
 

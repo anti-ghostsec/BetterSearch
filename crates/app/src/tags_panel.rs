@@ -75,7 +75,7 @@ impl Default for TagsPanel {
 		TagsPanel {
 			filter: String::new(),
 			all: false,
-			made_for: (0, 0, 0),
+			made_for: (u64::MAX, usize::MAX, u64::MAX),
 			last: std::time::Instant::now() - std::time::Duration::from_secs(5),
 			stats: Vec::new(),
 			links: Vec::new(),

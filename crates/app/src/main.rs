@@ -179,6 +179,9 @@ struct App {
 	brief_calls: Vec<std::time::Instant>,
 	save_dialog: Option<SaveDialog>,
 	taste_tab: bool,
+	/// Thumbnails allowed to start this frame, so a whole page doesn't decode
+	/// and upload in one go.
+	thumb_budget: usize,
 	chat: Vec<(bool, String)>,
 	chat_input: String,
 	models: Vec<String>,
@@ -288,6 +291,7 @@ impl App {
 			brief_calls: Vec::new(),
 			save_dialog: None,
 			taste_tab: false,
+			thumb_budget: 16,
 			chat: Vec::new(),
 			chat_input: String::new(),
 			models: Vec::new(),
@@ -592,13 +596,9 @@ impl App {
 		if hosts.is_empty() {
 			return;
 		}
-		for (host, header, n) in cookies::harvest(&hosts) {
-			bettersearch_core::sites::set_cookie(&host, &header);
-			if let Ok(store) = self.store.lock() {
-				let _ = store.set_cookie(&host, &header);
-			}
-			let _ = n;
-		}
+		// On a thread: opening cookie databases can take a moment, and the
+		// search shouldn't wait for it.
+		self.worker.harvest(hosts, self.store.clone(), self.ctx.clone());
 	}
 
 	fn search_on(&mut self, sites: Vec<Arc<dyn Site>>) {
@@ -786,7 +786,10 @@ impl App {
 	/// An image's texture, fetched with the client of the site it's from.
 	fn texture(&mut self, site: &str, url: &str) -> Option<&TextureHandle> {
 		if !self.textures.contains_key(url) {
-			if let Some(site) = self.site_by_id(site) {
+			if self.thumb_budget > 0
+				&& let Some(site) = self.site_by_id(site)
+			{
+				self.thumb_budget -= 1;
 				self.textures.insert(url.to_string(), Tex::Loading);
 				self.worker.image(site, url.to_string());
 			}
@@ -1326,7 +1329,7 @@ impl App {
 						None => {
 							let p = &self.posts[i];
 							let text = if imageless(p) {
-								format!("{} hides this\nwhen logged out", p.site)
+								format!("{} sent this\nwithout an address", p.site)
 							} else if !self.site_shows(&p.site) {
 								format!("{} only shows\nits images on\nits own website", p.site)
 							} else if failed {
@@ -1415,9 +1418,9 @@ impl App {
 				if hidden > 0 {
 					let sites: BTreeSet<&str> = self.posts.iter().filter(|p| imageless(p)).map(|p| p.site.as_str()).collect();
 					let sites = sites.into_iter().collect::<Vec<_>>().join(", ");
-					ui.label(RichText::new(format!("· {hidden} hidden by {sites} when logged out"))
+					ui.label(RichText::new(format!("· {hidden} hidden (no addresses from {sites})"))
 						.color(Color32::from_rgb(230, 170, 60)))
-						.on_hover_text("The site sent these without images because you're not logged in. Add your login in ⚙ Settings to see them.");
+						.on_hover_text("These came without image addresses. Some sites need a login; some (TBIB) never send them and only give the file name.");
 				}
 				if self.running_saved.is_some() {
 					let new = self.posts.iter().filter(|p| self.new_after.get(&p.site).is_some_and(|seen| p.id > *seen)).count();
@@ -2038,16 +2041,6 @@ impl App {
 				changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.e6ai_key).password(true)).changed();
 			});
 			ui.add_space(8.0);
-			ui.label("Optional TBIB login (it hides file addresses from logged-out callers):");
-			ui.horizontal(|ui| {
-				ui.label("Username");
-				changed |= ui.text_edit_singleline(&mut self.settings.tbib_user).changed();
-			});
-			ui.horizontal(|ui| {
-				ui.label("API key ");
-				changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.tbib_key).password(true)).changed();
-			});
-			ui.add_space(8.0);
 			ui.separator();
 			ui.strong("Custom boorus");
 			ui.label(
@@ -2539,6 +2532,7 @@ impl App {
 			self.api_started = true;
 			self.sync_api();
 		}
+		self.thumb_budget = 16;
 
 		let ctx = ui.ctx().clone();
 		self.receive(&ctx);
@@ -2728,13 +2722,13 @@ mod tests {
 		for _ in 0..2 {
 			seen = texts(&mut app, &ctx, 1300.0);
 		}
-		assert!(has(&seen, "1 shown") && has(&seen, "1 hidden by e621 when logged out"), "{:?}", seen.iter().map(|(t, _)| t).collect::<Vec<_>>());
+		assert!(has(&seen, "1 shown") && has(&seen, "1 hidden (no addresses from e621)"), "{:?}", seen.iter().map(|(t, _)| t).collect::<Vec<_>>());
 		assert!(!has(&seen, "hides this"));
 		app.settings.show_imageless = true;
 		for _ in 0..2 {
 			seen = texts(&mut app, &ctx, 1300.0);
 		}
-		assert!(has(&seen, "2 shown") && has(&seen, "e621 hides this") && !has(&seen, "hidden by"));
+		assert!(has(&seen, "2 shown") && has(&seen, "e621 sent this") && !has(&seen, "hidden (no addresses"));
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
