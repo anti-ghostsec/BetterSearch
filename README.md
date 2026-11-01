@@ -27,6 +27,11 @@ Settings; e621 asks every app to say who runs it.
 All of those are off until ticked in the site menu, and every one can be mixed
 with the others.
 
+Danbooru sits behind Cloudflare and throttles: a challenge or a 429 gets up to
+three tries, waiting whatever `Retry-After` asks. A page that comes back with no
+addresses at all is retried once after a pause, since that is usually a cut-back
+answer rather than the real one.
+
 **Custom boorus** (⚙ Settings → Custom boorus) take any site speaking one of
 those four APIs: the address, a name, and the API family. https only, and the
 address is the site root, not a page. They're searched like the built-ins and

@@ -66,22 +66,47 @@ impl Danbooru {
 	}
 
 	fn get<T: for<'de> Deserialize<'de>>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
-		self.throttle.wait();
 		let url = format!("{}{path}", self.base);
-		let mut req = super::with_cookie(self.client.get(url), &format!("{}{path}", self.base)).query(query);
-		if let Some((u, k)) = &self.login {
-			req = req.basic_auth(u, Some(k));
-		}
-		let res = req.send()?;
-		let status = res.status();
-		if !status.is_success() {
+		let mut attempt = 0u32;
+		loop {
+			self.throttle.wait();
+			let mut req = super::with_cookie(self.client.get(&url), &url).query(query);
+			if let Some((u, k)) = &self.login {
+				req = req.basic_auth(u, Some(k));
+			}
+			let res = req.send()?;
+			let status = res.status();
+			let asked = res
+				.headers()
+				.get(reqwest::header::RETRY_AFTER)
+				.and_then(|v| v.to_str().ok())
+				.and_then(|v| v.parse::<u64>().ok());
 			let body = res.text().unwrap_or_default();
+			if status.is_success() {
+				return serde_json::from_str(&body).map_err(|e| Error::Api { site: self.name.clone(), message: e.to_string() });
+			}
+			let challenge = body.contains("Just a moment");
+			// Cloudflare challenges and throttles come and go in seconds; three
+			// tries with the site's own delay is worth it before failing.
+			let retriable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+				|| status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+				|| (status == reqwest::StatusCode::FORBIDDEN && challenge);
+			if retriable && attempt < 2 {
+				attempt += 1;
+				std::thread::sleep(Duration::from_secs(asked.unwrap_or(u64::from(challenge) * 2 + 2).min(15)));
+				continue;
+			}
 			let message = serde_json::from_str::<ApiError>(&body).ok().and_then(|e| e.message).unwrap_or_else(|| {
-				if body.contains("Just a moment") { "blocked by the site's bot check".into() } else { status.to_string() }
+				if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+					"rate-limited; give it a moment".into()
+				} else if challenge {
+					"blocked by the site's bot check".into()
+				} else {
+					status.to_string()
+				}
 			});
 			return Err(Error::Api { site: self.name.clone(), message });
 		}
-		Ok(res.json()?)
 	}
 
 	/// The account's tag limit; asked once, 2 if the site doesn't say.
@@ -311,7 +336,19 @@ impl Site for Danbooru {
 			Some(Cursor::Page(n)) => q.push(("page", n.to_string())),
 			None => {}
 		}
-		let raw: Vec<RawPost> = self.get("/posts.json", &q)?;
+		let mut raw: Vec<RawPost> = self.get("/posts.json", &q)?;
+		// A page of posts with no addresses at all means the response was cut
+		// back (challenge or throttle). One retry usually gets the real thing.
+		let bare = !raw.is_empty()
+			&& raw.iter().all(|p| p.file_url.is_none() && p.large_file_url.is_none() && p.preview_file_url.is_none());
+		if bare {
+			std::thread::sleep(Duration::from_secs(3));
+			if let Ok(again) = self.get::<Vec<RawPost>>("/posts.json", &q)
+				&& again.iter().any(|p| p.file_url.is_some() || p.large_file_url.is_some() || p.preview_file_url.is_some())
+			{
+				raw = again;
+			}
+		}
 		let full = raw.len() >= limit;
 		let posts: Vec<Post> = raw.into_iter().map(|p| self.to_post(p)).collect();
 		let ordered = query.split_whitespace().any(|w| w.starts_with("order:"));
