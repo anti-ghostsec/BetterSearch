@@ -63,7 +63,14 @@ impl Moebooru {
 		if !res.status().is_success() {
 			return Err(Error::Api { site: self.name.clone(), message: res.status().to_string() });
 		}
-		Ok(res.text()?)
+		let body = res.text()?;
+		if body.trim_start().starts_with('<') {
+			return Err(Error::Api {
+				site: self.name.clone(),
+				message: "blocked by the site's bot check; a cookie from a browser gets past it (Settings → Blocked sites)".into(),
+			});
+		}
+		Ok(body)
 	}
 
 	/// `order:x` stays as the site spells it; everything else is plain.

@@ -100,7 +100,15 @@ impl E621 {
 				.unwrap_or_else(|| status.to_string());
 			return Err(Error::Api { site: self.name.clone(), message });
 		}
-		Ok(res.json()?)
+		// A challenge page is HTML, which otherwise fails as a decode error.
+		let body = res.text()?;
+		if body.trim_start().starts_with('<') {
+			return Err(Error::Api {
+				site: self.name.clone(),
+				message: "blocked by the site's bot check; a cookie from a browser gets past it (Settings → Blocked sites)".into(),
+			});
+		}
+		serde_json::from_str(&body).map_err(|e| Error::Api { site: self.name.clone(), message: e.to_string() })
 	}
 
 	fn iqdb_post(&self, p: RawIqdbPost) -> Post {

@@ -148,7 +148,14 @@ impl Gelbooru {
 		if !status.is_success() {
 			return Err(Error::Api { site: self.name.clone(), message: status.to_string() });
 		}
-		Ok(res.text()?)
+		let body = res.text()?;
+		if body.trim_start().starts_with('<') {
+			return Err(Error::Api {
+				site: self.name.clone(),
+				message: "blocked by the site's bot check; a cookie from a browser gets past it (Settings → Blocked sites)".into(),
+			});
+		}
+		Ok(body)
 	}
 
 	fn dapi(&self, s: &str, extra: Vec<(&str, String)>) -> Result<String> {
