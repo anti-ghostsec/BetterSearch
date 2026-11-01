@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::plan::{Plan, apply_aliases, apply_translations, plan, tags_in};
 use crate::post::{Post, Rating};
-use crate::query::{Expr, parse};
+use crate::query::{Expr, Subject, parse};
 use crate::sites::{Cursor, Site};
 use crate::learn::learn;
 use crate::store::{Asked, RelationEntry, Store};
@@ -15,12 +15,30 @@ use crate::{Error, Result};
 /// Most site requests one `next` call may make, so a search that matches
 /// little doesn't run forever. Calling `next` again carries on.
 const MAX_REQUESTS: usize = 8;
+/// Fewest posts one request asks for. A request asks for about what's still
+/// wanted, not the site's whole page: e621 takes three times as long to send
+/// 320 posts as 60, and the rest would only wait in the buffer.
+const MIN_LIMIT: usize = 20;
 
 struct Stream {
 	query: String,
 	started: bool,
 	next: Option<Cursor>,
 	buf: VecDeque<Post>,
+	/// The size of the first page, which numbered pages have to keep.
+	limit: usize,
+	/// Tags the query asked the site for. The site matched them, under
+	/// whatever name it gives each tag now, so they count as on its posts.
+	vouched: Vec<String>,
+}
+
+impl Stream {
+	fn new(query: String, filter: &Expr) -> Stream {
+		let tags = tags_in_all(filter);
+		let vouched =
+			query.split_whitespace().filter(|w| !w.starts_with(['-', '~']) && !w.contains('*') && tags.iter().any(|t| t == w)).map(String::from).collect();
+		Stream { query, started: false, next: None, buf: VecDeque::new(), limit: 0, vouched }
+	}
 }
 
 impl Stream {
@@ -58,6 +76,65 @@ pub struct Search {
 	local_done: bool,
 	/// Posts looked at so far, matching or not.
 	pub checked: usize,
+	/// Posts the site has sent so far.
+	fetched: usize,
+	/// Say which tags the site lacks, if it sends nothing at all.
+	check_tags: bool,
+}
+
+/// A post with its query's vouched tags counted as on it. Without this, a
+/// site without an alias list loses every post here: Safebooru answers
+/// `golden_eyes` with posts tagged `amber_eyes`, which the check would drop.
+struct Vouched<'a> {
+	subject: &'a dyn Subject,
+	tags: &'a [String],
+}
+
+impl Subject for Vouched<'_> {
+	fn has_tag(&self, tag: &str) -> bool {
+		self.tags.iter().any(|t| t == tag) || self.subject.has_tag(tag)
+	}
+	fn meta(&self, key: &str, value: &str) -> Option<bool> {
+		self.subject.meta(key, value)
+	}
+	fn linked(&self, kind: Option<&str>, tags: &[String]) -> bool {
+		self.subject.linked(kind, tags)
+	}
+	fn tags(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+		self.subject.tags()
+	}
+}
+
+/// Post counts for these tags, asking the site only for the ones not looked
+/// up this run. An error only when the site was asked and failed.
+fn tag_counts(site: &dyn Site, store: &Mutex<Store>, names: &[String]) -> Result<HashMap<String, u64>> {
+	let mut out = HashMap::new();
+	let unknown: Vec<String> = {
+		let s = store.lock().unwrap();
+		names
+			.iter()
+			.filter(|n| !n.contains('*'))
+			.filter(|n| match s.cached_count(site.id(), n) {
+				Some(c) => {
+					out.insert((*n).clone(), c);
+					false
+				}
+				None => true,
+			})
+			.cloned()
+			.collect()
+	};
+	if !unknown.is_empty() {
+		let found = site.tag_counts(&unknown)?;
+		let mut s = store.lock().unwrap();
+		// Only what came back: some sites look up a few names at most, so a
+		// missing one may just not have been asked.
+		for (n, c) in &found {
+			s.remember_count(site.id(), n, *c);
+		}
+		out.extend(found);
+	}
+	Ok(out)
 }
 
 /// The search for the ratings ticked: one is `rating:x`, two is `-rating:y`, all three adds nothing.
@@ -144,8 +221,8 @@ impl Search {
 		Self::start_with(site, text, ratings, store, false)
 	}
 
-	/// `check_tags` also looks up tag counts to warn about tags the site
-	/// doesn't have, which matters most when one search runs on several sites.
+	/// `check_tags`: if the site sends nothing, look up which tags it doesn't
+	/// have, which matters most when one search runs on several sites.
 	pub fn start_with(site: Arc<dyn Site>, text: &str, ratings: &[Rating], store: &Mutex<Store>, check_tags: bool) -> Result<Search> {
 		let mut notes = Vec::new();
 		let (question, mut expr) = {
@@ -180,7 +257,7 @@ impl Search {
 		// Only joined names the site actually has are used, and the note says so.
 		let pairs = spaced_pairs(&expr);
 		if !pairs.is_empty() {
-			let counts = site.tag_counts(&pairs.iter().take(3).cloned().collect::<Vec<_>>()).unwrap_or_default();
+			let counts = tag_counts(site.as_ref(), store, &pairs.iter().take(3).cloned().collect::<Vec<_>>()).unwrap_or_default();
 			let (joined, made) = join_tags(expr, &counts, 50);
 			for pair in made {
 				notes.push(format!("“{}” is searched as “{pair}”.", pair.replace('_', " ")));
@@ -224,7 +301,15 @@ impl Search {
 				.cloned()
 				.collect()
 		};
-		if !unknown.is_empty() {
+		// The site follows its own aliases, and a post counts as having the tags
+		// it was found by. So when the whole search goes to the site as written,
+		// the site's names change nothing here and the lookup is skipped (on e621
+		// it holds the search up a second). Your links' tags are still looked up.
+		let whole = || {
+			let e = apply_aliases(&expr, &aliases);
+			site_takes_all(&e, &plan(&e, &caps, &HashMap::new()))
+		};
+		if !unknown.is_empty() && !(unknown.iter().all(|n| asked.contains(n)) && whole()) {
 			match site.aliases(&unknown) {
 				Ok(found) => {
 					let mut s = store.lock().unwrap();
@@ -242,25 +327,9 @@ impl Search {
 		expr = apply_aliases(&expr, &aliases);
 		expr = store.lock().unwrap().resolve_links(&expr)?;
 
-		// Counts only matter when there are more tags than the site takes, or to check them.
-		let names = tags_in(&expr);
-		let counts = if check_tags || names.len() + 2 > caps.max_tags {
-			match site.tag_counts(&names) {
-				Ok(counts) => {
-					if check_tags {
-						for n in names.iter().filter(|n| counts.get(*n).is_none_or(|c| *c == 0)) {
-							notes.push(format!("“{n}” has no posts on {}; a tag translation can fix that.", site.name()));
-						}
-					}
-					counts
-				}
-				Err(_) => HashMap::new(),
-			}
-		} else {
-			HashMap::new()
-		};
-
-		let mut plan = plan(&expr, &caps, &counts);
+		// Counts only change the plan when some tags don't fit: they pick the rarest.
+		let first = plan(&expr, &caps, &HashMap::new());
+		let mut plan = if first.crowded { plan(&expr, &caps, &tag_counts(site.as_ref(), store, &tags_in(&expr)).unwrap_or_default()) } else { first };
 		notes.append(&mut plan.notes);
 		plan.notes = notes;
 		let favorites_only = conjuncts_of(&plan.filter)
@@ -274,9 +343,20 @@ impl Search {
 		let streams = if plan.local {
 			Vec::new()
 		} else {
-			plan.queries.iter().map(|q| Stream { query: q.clone(), started: false, next: None, buf: VecDeque::new() }).collect()
+			plan.queries.iter().map(|q| Stream::new(q.clone(), &plan.filter)).collect()
 		};
-		Ok(Search { site, plan, asked: relation, favorites_only, streams, seen: HashSet::new(), local_done: false, checked: 0 })
+		Ok(Search {
+			site,
+			plan,
+			asked: relation,
+			favorites_only,
+			streams,
+			seen: HashSet::new(),
+			local_done: false,
+			checked: 0,
+			fetched: 0,
+			check_tags,
+		})
 	}
 
 	/// `rabbit eat relation`: the relation index's objects for each subject
@@ -374,34 +454,35 @@ impl Search {
 		// what the site sends instead of all coming ahead of it.
 		if !self.local_done && self.wants_saved() {
 			self.local_done = true;
-			let saved = {
+			let saved_posts = {
 				let s = store.lock().unwrap();
 				if self.favorites_only { s.favorite_posts(self.site.id())? } else { s.linked_posts(self.site.id())? }
 			};
-			self.streams.push(Stream { query: String::new(), started: true, next: None, buf: saved.into() });
+			let mut saved = Stream::new(String::new(), &self.plan.filter);
+			saved.started = true;
+			saved.buf = saved_posts.into();
+			self.streams.push(saved);
 		}
 
 		let page_size = self.site.caps().page_size;
 		let mut requests = 0;
+		// Requests made to each stream in this call.
+		let mut asked = vec![0; self.streams.len()];
 		'outer: while out.len() < want {
 			// Every stream with more to give needs a post buffered before the
 			// newest can be picked.
-			for s in &mut self.streams {
+			for (i, made) in asked.iter_mut().enumerate() {
+				let s = &self.streams[i];
 				if s.buf.is_empty() && s.has_more() {
 					if requests >= MAX_REQUESTS {
 						break 'outer;
 					}
 					requests += 1;
-					let page = self.site.search(&s.query, s.next, page_size)?;
-					s.started = true;
-					s.next = page.next;
-					{
-						let s = store.lock().unwrap();
-						s.save_posts(&page.posts)?;
-						// Before the check, so searches for links see filled-in ones too.
-						s.auto_link(&page.posts)?;
-					}
-					s.buf.extend(page.posts);
+					// A second request in one call means posts are being dropped
+					// here: a full page finds the rest in fewer requests.
+					let need = if *made == 0 { want - out.len() } else { page_size };
+					*made += 1;
+					self.fetch(i, need, store)?;
 				}
 			}
 			let pick = if self.plan.ordered {
@@ -424,14 +505,79 @@ impl Search {
 			self.checked += 1;
 			let keep = {
 				let s = store.lock().unwrap();
-				self.plan.filter.matches(&s.subject(&post)?)
+				let subject = s.subject(&post)?;
+				self.plan.filter.matches(&Vouched { subject: &subject, tags: &self.streams[i].vouched })
 			};
 			if keep {
 				out.push(post);
 			}
 		}
+		if self.check_tags && self.fetched == 0 && !self.plan.local && self.streams.iter().all(|s| s.started) {
+			self.check_tags = false;
+			self.name_missing_tags(store);
+		}
 		Ok(out)
 	}
+
+	/// Fetches one page ahead for the query with the fewest posts waiting, if
+	/// it has fewer than `want`, so the next `next` needn't wait on the site.
+	/// A failure is left for `next` to meet and report.
+	pub fn prefetch(&mut self, want: usize, store: &Mutex<Store>) {
+		let short = (0..self.streams.len())
+			.filter(|&i| self.streams[i].started && self.streams[i].has_more() && self.streams[i].buf.len() < want)
+			.min_by_key(|&i| self.streams[i].buf.len());
+		if let Some(i) = short {
+			let _ = self.fetch(i, want, store);
+		}
+	}
+
+	/// Asks the site for stream `i`'s next page, about `need` posts.
+	fn fetch(&mut self, i: usize, need: usize, store: &Mutex<Store>) -> Result<()> {
+		let page_size = self.site.caps().page_size;
+		let s = &mut self.streams[i];
+		let limit = match s.next {
+			// Page n only follows on from the pages before it at their size.
+			Some(Cursor::Page(_)) => s.limit,
+			_ => need.max(MIN_LIMIT).min(page_size),
+		};
+		let page = self.site.search(&s.query, s.next, limit)?;
+		if !s.started {
+			s.limit = limit;
+		}
+		s.started = true;
+		s.next = page.next;
+		{
+			let st = store.lock().unwrap();
+			st.save_posts(&page.posts)?;
+			// Before the check, so searches for links see filled-in ones too.
+			st.auto_link(&page.posts)?;
+		}
+		let sent = page.posts.len();
+		s.buf.extend(page.posts);
+		self.fetched += sent;
+		Ok(())
+	}
+
+	/// The site sent nothing at all: names the tags it has no posts for.
+	fn name_missing_tags(&mut self, store: &Mutex<Store>) {
+		let names = tags_in(&self.plan.filter);
+		if let Ok(counts) = tag_counts(self.site.as_ref(), store, &names) {
+			for n in names.iter().filter(|n| counts.get(*n).is_none_or(|c| *c == 0)) {
+				self.plan.notes.push(format!("“{n}” has no posts on {}; a tag translation can fix that.", self.site.name()));
+			}
+		}
+	}
+}
+
+/// Whether every tag goes to the site as written, in every query, so the site
+/// alone decides which posts have them.
+fn site_takes_all(expr: &Expr, plan: &Plan) -> bool {
+	!plan.crowded
+		&& !plan.local
+		// Links and favorites are checked against what's saved here, by name.
+		&& !expr.any(&|e| matches!(e, Expr::Link { .. }))
+		&& expr.meta_value("favorited").is_none()
+		&& tags_in_all(expr).iter().all(|t| plan.queries.iter().all(|q| q.split_whitespace().any(|w| w.strip_prefix('-').unwrap_or(w) == t)))
 }
 
 /// The ANDed parts of a search, flattened.
@@ -616,8 +762,9 @@ mod tests {
 	fn follows_site_aliases() {
 		let site = fake();
 		let store = Mutex::new(Store::in_memory().unwrap());
-		let mut s = Search::start(site, "old", &Rating::ALL, &store).unwrap();
-		assert_eq!(s.plan.queries, vec!["a"]);
+		// More tags than the site takes: some are checked here, by the site's names.
+		let mut s = Search::start(site, "old -zzz -yyy -xxx", &Rating::ALL, &store).unwrap();
+		assert_eq!(s.plan.queries, vec!["a -zzz"]);
 		assert_eq!(ids(&s.next(10, &store).unwrap()), vec![5, 3, 1]);
 	}
 
@@ -951,6 +1098,125 @@ mod tests {
 		assert_eq!(all.len(), n);
 	}
 
+
+	/// 300 posts, all tagged `new`, which the site also finds as `old` (its
+	/// alias) without saying so. Ignores negated tags, so they're checked
+	/// here. Records each request's limit and cursor.
+	#[derive(Default)]
+	struct Renaming {
+		requests: Mutex<Vec<(usize, Option<Cursor>)>>,
+		counted: Mutex<Vec<String>>,
+		aliased: Mutex<Vec<String>>,
+	}
+
+	impl Site for Renaming {
+		fn id(&self) -> &str {
+			"renaming"
+		}
+		fn name(&self) -> &str {
+			"Renaming"
+		}
+		fn base(&self) -> &str {
+			"https://example.invalid"
+		}
+		fn caps(&self) -> Capabilities {
+			Capabilities { max_tags: 6, tilde_or: true, max_wildcards: 1, metas: &["rating", "order"], free_metas: &[], page_size: 100 }
+		}
+		fn search(&self, query: &str, cursor: Option<Cursor>, limit: usize) -> Result<Page> {
+			self.requests.lock().unwrap().push((limit, cursor));
+			let words: Vec<&str> = query.split_whitespace().filter(|w| !w.contains(':') && !w.starts_with('-')).collect();
+			if !words.iter().all(|w| matches!(*w, "old" | "new")) {
+				return Ok(Page { posts: Vec::new(), next: None });
+			}
+			let ids: Vec<u64> = match cursor {
+				Some(Cursor::Before(id)) => (1..id.min(301)).rev().take(limit).collect(),
+				Some(Cursor::Page(n)) => (1..=300).rev().skip((n as usize - 1) * limit).take(limit).collect(),
+				None => (1..=300).rev().take(limit).collect(),
+			};
+			let posts: Vec<Post> = ids.iter().map(|&id| Post { site: "renaming".into(), ..post(id, &["new"]) }).collect();
+			let ordered = query.contains("order:");
+			let next = match (posts.len() == limit, ordered, cursor) {
+				(false, _, _) => None,
+				(true, false, _) => posts.last().map(|p| Cursor::Before(p.id)),
+				(true, true, Some(Cursor::Page(n))) => Some(Cursor::Page(n + 1)),
+				(true, true, _) => Some(Cursor::Page(2)),
+			};
+			Ok(Page { posts, next })
+		}
+		fn tag_counts(&self, names: &[String]) -> Result<HashMap<String, u64>> {
+			self.counted.lock().unwrap().extend(names.iter().cloned());
+			Ok(names.iter().filter(|n| *n == "new").map(|n| (n.clone(), 300)).collect())
+		}
+		fn aliases(&self, names: &[String]) -> Result<HashMap<String, String>> {
+			self.aliased.lock().unwrap().extend(names.iter().cloned());
+			Ok(HashMap::new())
+		}
+		fn autocomplete(&self, _: &str) -> Result<Vec<TagSuggestion>> {
+			Ok(Vec::new())
+		}
+		fn fetch_bytes(&self, _: &str) -> Result<Vec<u8>> {
+			Ok(Vec::new())
+		}
+	}
+
+	#[test]
+	fn a_tag_the_site_renames_still_counts() {
+		// Like Safebooru answering `golden_eyes` with `amber_eyes` posts.
+		let site = Arc::new(Renaming::default());
+		let store = Mutex::new(Store::in_memory().unwrap());
+		let mut s = Search::start(site.clone(), "old", &Rating::ALL, &store).unwrap();
+		assert_eq!(s.next(10, &store).unwrap().len(), 10);
+		// The whole search went to the site, so its names weren't asked for.
+		assert!(site.aliased.lock().unwrap().is_empty());
+		// What the site leaves out is still checked here.
+		let site = Arc::new(Renaming::default());
+		let mut s = Search::start(site.clone(), "old -new", &Rating::ALL, &store).unwrap();
+		assert_eq!(s.plan.queries, vec!["old -new"]);
+		assert!(s.next(10, &store).unwrap().is_empty());
+		assert!(site.requests.lock().unwrap().len() > 1);
+	}
+
+	#[test]
+	fn asks_for_about_what_is_wanted_and_reads_ahead() {
+		let site = Arc::new(Renaming::default());
+		let store = Mutex::new(Store::in_memory().unwrap());
+		let mut s = Search::start(site.clone(), "new", &Rating::ALL, &store).unwrap();
+		assert_eq!(ids(&s.next(30, &store).unwrap()), (271..=300).rev().collect::<Vec<_>>());
+		s.prefetch(30, &store);
+		assert_eq!(*site.requests.lock().unwrap(), vec![(30, None), (30, Some(Cursor::Before(271)))]);
+		// The next page is already here, and nothing is skipped or repeated.
+		assert_eq!(ids(&s.next(30, &store).unwrap()), (241..=270).rev().collect::<Vec<_>>());
+		assert_eq!(site.requests.lock().unwrap().len(), 2);
+		// A few posts wanted still asks for a sensible number.
+		s.next(70, &store).unwrap();
+		s.next(3, &store).unwrap();
+		assert_eq!(site.requests.lock().unwrap()[2..], [(70, Some(Cursor::Before(241))), (20, Some(Cursor::Before(171)))]);
+	}
+
+	#[test]
+	fn numbered_pages_keep_their_size() {
+		let site = Arc::new(Renaming::default());
+		let store = Mutex::new(Store::in_memory().unwrap());
+		let mut s = Search::start(site.clone(), "new order:score", &Rating::ALL, &store).unwrap();
+		let mut all = ids(&s.next(30, &store).unwrap());
+		all.extend(ids(&s.next(90, &store).unwrap()));
+		assert!(site.requests.lock().unwrap().iter().all(|(limit, _)| *limit == 30));
+		assert_eq!(all, (181..=300).rev().collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn missing_tags_are_named_only_when_nothing_comes() {
+		let store = Mutex::new(Store::in_memory().unwrap());
+		let site = Arc::new(Renaming::default());
+		let mut s = Search::start_with(site.clone(), "new", &Rating::ALL, &store, true).unwrap();
+		s.next(10, &store).unwrap();
+		assert!(site.counted.lock().unwrap().is_empty());
+		let site = Arc::new(Renaming::default());
+		let mut s = Search::start_with(site.clone(), "new zzz", &Rating::ALL, &store, true).unwrap();
+		assert!(s.next(10, &store).unwrap().is_empty());
+		assert!(s.plan.notes.iter().any(|n| n == "“zzz” has no posts on Renaming; a tag translation can fix that."), "{:?}", s.plan.notes);
+		assert!(!s.plan.notes.iter().any(|n| n.contains("“new”")));
+	}
 
 	#[test]
 	fn favorites_stay_on_this_computer() {

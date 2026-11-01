@@ -30,6 +30,9 @@ pub struct Plan {
 	pub local: bool,
 	/// Has `order:`, so pages come in the site's order and can't be merged.
 	pub ordered: bool,
+	/// Some tags didn't fit the site's limit. Only then do tag counts change
+	/// the plan, by picking the rarest to send.
+	pub crowded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +226,7 @@ pub fn plan(expr: &Expr, caps: &Capabilities, counts: &HashMap<String, u64>) -> 
 		notes.push("Nothing narrow enough to send to the site, so the newest posts are checked here. This can take a while.".into());
 	}
 
-	Plan { queries, filter: expr.clone(), notes, local, ordered }
+	Plan { queries, filter: expr.clone(), notes, local, ordered, crowded: !dropped.is_empty() }
 }
 
 /// Moves NOTs inward so a site can take them: -(a | b) is -a -b, which is how

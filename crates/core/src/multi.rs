@@ -4,11 +4,16 @@
 //
 // Ids and dates don't line up across sites, so the merge takes turns rather
 // than sorting: newest first within each site, interleaved.
+//
+// Sites are asked at the same time, one thread each, so a search waits on the
+// slowest site rather than on all of them in a row. Each site keeps its own
+// spacing between requests.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::post::{Post, Rating};
+use crate::query::parse;
 use crate::search::{AskedHere, Search};
 use crate::sites::Site;
 use crate::store::Store;
@@ -39,9 +44,21 @@ impl MultiSearch {
 			return Err(Error::Query(format!("None of the ticked sites has posts with the ratings ticked. {}", problems.join(" "))));
 		}
 		let several = sites.len() > 1;
+		// `rabbit eat relation` may learn on the first site what the others then
+		// use from the index, so those start in turn.
+		let learns = !store.lock().unwrap().read_relations(&parse(text)?)?.asked.is_empty();
+		let start = |site: &Arc<dyn Site>| Search::start_with(site.clone(), text, ratings, store, several);
+		let started: Vec<Result<Search>> = if learns || !several {
+			sites.iter().map(|s| start(s)).collect()
+		} else {
+			std::thread::scope(|scope| {
+				let jobs: Vec<_> = sites.iter().map(|s| scope.spawn(|| start(s))).collect();
+				jobs.into_iter().map(|j| j.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+			})
+		};
 		let mut searches = Vec::new();
-		for site in sites {
-			match Search::start_with(site.clone(), text, ratings, store, several) {
+		for (site, started) in sites.iter().zip(started) {
+			match started {
 				Ok(s) => searches.push(s),
 				// A search that doesn't read fails the same way everywhere.
 				Err(e @ Error::Query(_)) => return Err(e),
@@ -117,25 +134,22 @@ impl MultiSearch {
 		}
 		let share = want.div_ceil(active);
 		let several = self.several();
+		let found = each(&mut self.searches, |s| if s.done() { None } else { Some(s.next(share, store)) });
 		let mut batches = Vec::new();
-		let mut i = 0;
-		while i < self.searches.len() {
-			let s = &mut self.searches[i];
-			if s.done() {
-				i += 1;
-				continue;
-			}
-			match s.next(share, store) {
-				Ok(posts) => {
-					batches.push(posts.into_iter());
-					i += 1;
-				}
-				Err(e) if !several => return Err(e),
-				Err(e) => {
-					self.problems.push(format!("{}: {e}", s.site().name()));
-					self.searches.remove(i);
+		let mut failed = Vec::new();
+		for (i, found) in found.into_iter().enumerate() {
+			match found {
+				None => {}
+				Some(Ok(posts)) => batches.push(posts.into_iter()),
+				Some(Err(e)) if !several => return Err(e),
+				Some(Err(e)) => {
+					self.problems.push(format!("{}: {e}", self.searches[i].site().name()));
+					failed.push(i);
 				}
 			}
+		}
+		for i in failed.into_iter().rev() {
+			self.searches.remove(i);
 		}
 		if self.searches.is_empty() {
 			return Err(Error::Query(format!("Every site failed. {}", self.problems.join(" "))));
@@ -175,6 +189,34 @@ impl MultiSearch {
 		}
 		Ok(out)
 	}
+
+	/// Fetches a page ahead on each site still going, all at once, so the next
+	/// `next` of about `want` posts needn't wait. Failures wait for `next`.
+	pub fn prefetch(&mut self, want: usize, store: &Mutex<Store>) {
+		let active = self.searches.iter().filter(|s| !s.done()).count();
+		if active == 0 {
+			return;
+		}
+		let share = want.div_ceil(active);
+		each(&mut self.searches, |s| {
+			if !s.done() {
+				s.prefetch(share, store);
+			}
+		});
+	}
+}
+
+/// `f` on every search, each on its own thread (one search needs none),
+/// answers in the searches' order.
+fn each<T: Send>(searches: &mut [Search], f: impl Fn(&mut Search) -> T + Sync) -> Vec<T> {
+	if let [one] = searches {
+		return vec![f(one)];
+	}
+	let f = &f;
+	std::thread::scope(|scope| {
+		let jobs: Vec<_> = searches.iter_mut().map(|s| scope.spawn(move || f(s))).collect();
+		jobs.into_iter().map(|j| j.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+	})
 }
 
 #[cfg(test)]

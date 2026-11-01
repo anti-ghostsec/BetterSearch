@@ -1,6 +1,8 @@
 // Moebooru-style boorus: yande.re, konachan.com, sakugabooru.com, and any
 // other site running the same software. One `post.json` endpoint takes tags,
-// a page and a limit; there is no alias or count mess to speak of.
+// a page and a limit. Its alias list names the target only by tag id, which
+// would take two requests a tag, so aliases aren't looked up: the site follows
+// them in its own searches, and a searched tag counts as on what comes back.
 //
 // Ratings are the site's own `s`/`q`/`e`. OR is not supported by the software,
 // so the planner is told to split them into separate searches.
@@ -105,7 +107,7 @@ impl Moebooru {
 			preview_url: non_empty(p.preview_url),
 			page_url: format!("{}/post/show/{}", self.base, p.id),
 			sources: non_empty(p.source).into_iter().collect(),
-			created_at: p.created_at.unwrap_or_default(),
+			created_at: p.created_at.map(|t| t.0).unwrap_or_default(),
 		}
 	}
 }
@@ -131,7 +133,41 @@ struct RawPost {
 	sample_url: Option<String>,
 	preview_url: Option<String>,
 	source: Option<String>,
-	created_at: Option<String>,
+	created_at: Option<When>,
+}
+
+/// A post's date. Moebooru sends seconds since 1970; a string is kept as is.
+struct When(String);
+
+impl<'de> Deserialize<'de> for When {
+	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+		#[derive(Deserialize)]
+		#[serde(untagged)]
+		enum Raw {
+			Secs(i64),
+			Text(String),
+		}
+		Ok(When(match Raw::deserialize(d)? {
+			Raw::Secs(secs) => utc(secs),
+			Raw::Text(t) => t,
+		}))
+	}
+}
+
+/// Seconds since 1970 as `2010-09-05 03:30 UTC`.
+fn utc(secs: i64) -> String {
+	let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+	// Days to a civil date (Howard Hinnant's algorithm).
+	let z = days + 719_468;
+	let era = z.div_euclid(146_097);
+	let doe = z.rem_euclid(146_097);
+	let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	let mp = (5 * doy + 2) / 153;
+	let day = doy - (153 * mp + 2) / 5 + 1;
+	let month = if mp < 10 { mp + 3 } else { mp - 9 };
+	let year = yoe + era * 400 + i64::from(month <= 2);
+	format!("{year:04}-{month:02}-{day:02} {:02}:{:02} UTC", rest / 3600, rest % 3600 / 60)
 }
 
 #[derive(Deserialize)]
@@ -142,12 +178,6 @@ struct RawTag {
 	#[serde(default)]
 	#[serde(rename = "type")]
 	kind: u8,
-}
-
-#[derive(Deserialize)]
-struct RawAlias {
-	antecedent_name: String,
-	consequent_name: String,
 }
 
 fn category(kind: u8) -> &'static str {
@@ -194,10 +224,14 @@ impl Site for Moebooru {
 			.map_err(|e| Error::Api { site: self.name.clone(), message: e.to_string() })?;
 		let full = raw.len() >= limit;
 		let posts: Vec<Post> = raw.into_iter().map(|p| self.to_post(p)).collect();
-		let next = match (full, cursor) {
-			(false, _) => None,
-			(true, Some(Cursor::Page(n))) => Some(Cursor::Page(n + 1)),
-			(true, _) => Some(Cursor::Page(2)),
+		// Newest first goes on by id, which new posts can't shift; a search with
+		// its own order goes by page.
+		let ordered = query.split_whitespace().any(|w| w.starts_with("order:"));
+		let next = match (full, ordered, cursor) {
+			(false, _, _) => None,
+			(true, false, _) => posts.iter().map(|p| p.id).min().map(Cursor::Before),
+			(true, true, Some(Cursor::Page(n))) => Some(Cursor::Page(n + 1)),
+			(true, true, _) => Some(Cursor::Page(2)),
 		};
 		Ok(Page { posts, next })
 	}
@@ -215,18 +249,9 @@ impl Site for Moebooru {
 		Ok(out)
 	}
 
-	fn aliases(&self, names: &[String]) -> Result<HashMap<String, String>> {
-		let mut out = HashMap::new();
-		for name in names.iter().take(25) {
-			let list: Vec<RawAlias> =
-				serde_json::from_str(&self.get("/tag_alias.json", &[("name", name.clone())])?).unwrap_or_default();
-			for a in list {
-				if a.antecedent_name == *name && a.consequent_name != *name {
-					out.insert(a.antecedent_name, a.consequent_name);
-				}
-			}
-		}
-		Ok(out)
+	fn aliases(&self, _names: &[String]) -> Result<HashMap<String, String>> {
+		// See the top of the file.
+		Ok(HashMap::new())
 	}
 
 	fn autocomplete(&self, prefix: &str) -> Result<Vec<TagSuggestion>> {
@@ -263,7 +288,7 @@ mod tests {
 		let json = r#"[{"id":410288,"tags":"tagme animal_ears","rating":"s","score":3,
 			"width":1920,"height":1080,"md5":"abc","file_url":"https://k-cdn.yande.re/a.png",
 			"sample_url":"https://k-cdn.yande.re/s.jpg","preview_url":"https://k-cdn.yande.re/t.jpg",
-			"source":"","created_at":"1793308007"}]"#;
+			"source":"","created_at":1793308007}]"#;
 		let raw: Vec<RawPost> = serde_json::from_str(json).unwrap();
 		let post = site.to_post(raw.into_iter().next().unwrap());
 		assert_eq!(post.tags, vec!["animal_ears", "tagme"]);
@@ -271,6 +296,8 @@ mod tests {
 		assert_eq!(post.ext, "png");
 		assert_eq!(post.page_url, "https://konachan.com/post/show/410288");
 		assert!(post.sources.is_empty());
+		// The site sends seconds, not text; a page of them used to fail to read.
+		assert_eq!(post.created_at, "2026-10-29 21:06 UTC");
 	}
 
 	#[test]

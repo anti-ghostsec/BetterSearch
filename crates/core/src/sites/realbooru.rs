@@ -175,7 +175,9 @@ impl Site for Realbooru {
 		Capabilities { max_tags: 16, tilde_or: true, max_wildcards: 1, metas: METAS, free_metas: &[], page_size: PER_PAGE as usize }
 	}
 
-	fn search(&self, query: &str, cursor: Option<Cursor>, limit: usize) -> Result<Page> {
+	/// Pages are always the site's 42 a rating, whatever the limit: the next
+	/// page starts after all of them, so any cut here would never be seen.
+	fn search(&self, query: &str, cursor: Option<Cursor>, _limit: usize) -> Result<Page> {
 		let (tags, wanted) = self.split_ratings(query);
 		let page = match cursor {
 			Some(Cursor::Page(n)) => n.max(1),
@@ -187,7 +189,7 @@ impl Site for Realbooru {
 		let asked: Vec<(&str, Rating)> = if wanted.is_empty() { vec![("", Rating::Explicit)] } else { wanted };
 		// One request per rating, together rather than in turn: the site is the
 		// slow part and each answer is independent.
-		let mut posts: Vec<Post> = std::thread::scope(|scope| {
+		let pages: Vec<Result<Vec<Post>>> = std::thread::scope(|scope| {
 			let jobs: Vec<_> = asked
 				.iter()
 				.map(|(name, rating)| {
@@ -198,16 +200,31 @@ impl Site for Realbooru {
 						if !full.is_empty() {
 							q.push(("tags", full));
 						}
-						self.get("/index.php", &q).map(|html| self.parse(&html, rating)).unwrap_or_default()
+						self.get("/index.php", &q).map(|html| self.parse(&html, rating))
 					})
 				})
 				.collect();
-			jobs.into_iter().filter_map(|j| j.join().ok()).flatten().collect()
+			jobs.into_iter().map(|j| j.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
 		});
+		let (mut posts, mut full, mut error) = (Vec::new(), false, None);
+		for answer in pages {
+			match answer {
+				Ok(list) => {
+					full |= list.len() >= PER_PAGE as usize;
+					posts.extend(list);
+				}
+				Err(e) => error = Some(e),
+			}
+		}
+		// A failure with nothing else to show is an error, not "no posts".
+		if posts.is_empty()
+			&& let Some(e) = error
+		{
+			return Err(e);
+		}
 		posts.sort_by_key(|p| std::cmp::Reverse(p.id));
 		posts.dedup_by(|a, b| a.id == b.id);
-		posts.truncate(limit.clamp(1, PER_PAGE as usize));
-		let next = (posts.len() >= limit.clamp(1, PER_PAGE as usize)).then_some(Cursor::Page(page + 1));
+		let next = full.then_some(Cursor::Page(page + 1));
 		Ok(Page { posts, next })
 	}
 

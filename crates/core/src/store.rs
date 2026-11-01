@@ -21,6 +21,8 @@ pub struct Store {
 	pub actor: String,
 	/// Site aliases looked up this run: (site, name) → current name, or None for "not an alias".
 	aliases: HashMap<(String, String), Option<String>>,
+	/// Tag post counts looked up this run: (site, name) → count, 0 for "no such tag".
+	counts: HashMap<(String, String), u64>,
 	/// Fill in links made before on posts as they arrive (see `auto_link`).
 	pub auto_links: bool,
 }
@@ -148,7 +150,7 @@ impl Store {
 		)?;
 		let opts = Options::default();
 		TagGraph::migrate(&conn, &opts)?;
-		Ok(Store { conn, opts, actor: "local".into(), aliases: HashMap::new(), auto_links: true })
+		Ok(Store { conn, opts, actor: "local".into(), aliases: HashMap::new(), counts: HashMap::new(), auto_links: true })
 	}
 
 	pub fn graph(&self) -> TagGraph<'_> {
@@ -441,6 +443,14 @@ impl Store {
 
 	pub fn remember_alias(&mut self, site: &str, name: &str, to: Option<String>) {
 		self.aliases.insert((site.to_string(), name.to_string()), to);
+	}
+
+	pub fn cached_count(&self, site: &str, name: &str) -> Option<u64> {
+		self.counts.get(&(site.to_string(), name.to_string())).copied()
+	}
+
+	pub fn remember_count(&mut self, site: &str, name: &str, count: u64) {
+		self.counts.insert((site.to_string(), name.to_string()), count);
 	}
 
 	/// What one site calls each translated tag: tag → search. An empty search

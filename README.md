@@ -136,14 +136,19 @@ Sites only take a flat list of tags with limits, so each search is **planned**
 - One OR of plain tags goes as `~a ~b`. A bigger OR, like
   `(fox smile) | (wolf -sketch)`, runs as **one search per side, merged newest
   first**, with repeats dropped.
-- **Old tag names** are looked up and swapped for the site's current ones,
-  so the local check doesn't throw away posts the site found under the new name.
+- **Old tag names**: a tag sent to the site counts as on every post the site
+  sends for it, since the site follows its own aliases (Safebooru answers
+  `golden_eyes` with `amber_eyes` posts). Tags checked here are swapped for the
+  site's current names first, on sites that can say (e621, Danbooru).
 - Every post that comes back is checked against the **whole** search, so the
   results are exact whatever the site could take.
 - A link's tags go to the site like plain tags (they're all on its post), and
   the link itself is checked here. Posts saved on this computer are checked
   first. A search with nothing to send the site (only `-links`) runs on saved
   posts alone.
+- The first page asks for about what fits on screen, not the site's whole page
+  (320 posts take e621 three times as long as 60), and the next page loads
+  while you look, so scrolling doesn't wait.
 
 ## Saved searches
 
@@ -160,7 +165,8 @@ space; the next save writes a vault without them.
 
 ## Several sites at once
 
-Tick more than one site in the site menu and a search runs on all of them.
+Tick more than one site in the site menu and a search runs on all of them, at
+the same time, so it waits on the slowest site rather than each in turn.
 Results take turns between the sites, and a file that turns up on two sites
 (same MD5; Safebooru copies a lot of Danbooru) shows once.
 
@@ -174,9 +180,9 @@ the site menu, or right-click a tag on a post → "Translate for other sites…"
 | `girl` | Danbooru | `1girl \| 2girls` |
 | `sketch` | Danbooru | *(empty: not on this site, left out there)* |
 
-A translation can be any search without links. When several sites are picked,
-the app also checks each tag's post count per site and says which tags a site
-doesn't have, so you know where a translation is needed. Site aliases still
+A translation can be any search without links. When several sites are picked
+and one sends nothing at all, the app checks that site's tag counts and says
+which tags it doesn't have, so you know where a translation is needed. Site aliases still
 apply after translating (e621 turns `wolf_ears` into `ears` on its own).
 
 ## Browsing

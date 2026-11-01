@@ -264,13 +264,14 @@ fn search_thread(jobs: Receiver<Job>, store: Arc<Mutex<Store>>, send: impl Fn(Ms
 		// When most posts get dropped here (many left-out tags), one round finds
 		// few; keep going, a few rounds, sending what's found as it comes.
 		let mut got = 0;
+		let mut failed = false;
 		for round in 1..=ROUNDS {
-			let problems = search.problems.len();
+			let notes = search.notes().len();
 			match search.next(want - got, &store) {
 				Ok(posts) => {
 					got += posts.len();
-					// A site that failed part way is named in the notes.
-					if search.problems.len() != problems {
+					// A site that failed part way, or one that sent nothing, is named in the notes.
+					if search.notes().len() != notes {
 						send(Msg::Planned { generation, queries: search.queries(), notes: search.notes(), asked: search.asked().into_iter().next().map(|(_, a)| a) });
 					}
 					// A newer search waiting stops this one.
@@ -287,9 +288,20 @@ fn search_thread(jobs: Receiver<Job>, store: Arc<Mutex<Store>>, send: impl Fn(Ms
 				}
 				Err(e) => {
 					send(Msg::Failed { generation, error: e.to_string() });
+					failed = true;
 					break;
 				}
 			}
+		}
+		// While the page is looked at, the next one comes in, so scrolling
+		// doesn't wait on the site. Anything already asked for goes first.
+		if pending.is_none()
+			&& let Ok(next) = jobs.try_recv()
+		{
+			pending = Some(next);
+		}
+		if !failed && pending.is_none() && !search.done() {
+			search.prefetch(want, &store);
 		}
 	}
 }
