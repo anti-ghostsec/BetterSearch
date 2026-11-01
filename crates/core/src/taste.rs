@@ -340,25 +340,39 @@ pub fn brief(endpoint: &str, key: &str, model: &str, tags: &[String], ratings: &
 		return Err(crate::Error::Query(format!("the model said {}", res.status())));
 	}
 	let value: serde_json::Value = res.json().map_err(|e| crate::Error::Query(e.to_string()))?;
-	let text = value["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string();
+	// Some endpoints answer with content parts instead of a string.
+	let message = &value["choices"][0]["message"]["content"];
+	let text = match message {
+		serde_json::Value::String(s) => s.clone(),
+		serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join(""),
+		_ => value["choices"][0]["text"].as_str().unwrap_or_default().to_string(),
+	};
+	let text = text.trim().to_string();
 	if text.is_empty() {
-		return Err(crate::Error::Query("the model answered nothing".into()));
+		return Err(crate::Error::Query("the model answered nothing; try again or pick another model".into()));
 	}
 	Ok(text)
 }
 
 /// Models the endpoint offers, so the picker can list real ones.
 pub fn models(endpoint: &str, key: &str) -> Result<Vec<String>> {
-	let url = format!("{}/models", endpoint.trim_end_matches('/'));
+	let base = format!("{}/models", endpoint.trim_end_matches('/'));
 	let client = reqwest::blocking::Client::builder()
 		.timeout(std::time::Duration::from_secs(20))
 		.build()
 		.map_err(|e| crate::Error::Query(e.to_string()))?;
-	let mut req = client.get(&url);
-	if !key.trim().is_empty() {
-		req = req.bearer_auth(key.trim());
+	let ask = |url: String| {
+		let mut req = client.get(url);
+		if !key.trim().is_empty() {
+			req = req.bearer_auth(key.trim());
+		}
+		req.send()
+	};
+	let mut res = ask(base.clone()).map_err(|e| crate::Error::Query(format!("unreachable: {e}")))?;
+	// Venice only lists text models when asked to.
+	if !res.status().is_success() && endpoint.contains("venice") {
+		res = ask(format!("{base}?type=text")).map_err(|e| crate::Error::Query(format!("unreachable: {e}")))?;
 	}
-	let res = req.send().map_err(|e| crate::Error::Query(format!("unreachable: {e}")))?;
 	if !res.status().is_success() {
 		return Err(crate::Error::Query(format!("the model list said {}", res.status())));
 	}
@@ -378,7 +392,7 @@ pub fn chat(endpoint: &str, key: &str, model: &str, system: &str, text: &str) ->
 	}
 	let body = serde_json::json!({
 		"model": model,
-		"max_tokens": 400,
+		"max_tokens": 700,
 		"temperature": 0.7,
 		"messages": [
 			{ "role": "system", "content": system },
@@ -399,9 +413,16 @@ pub fn chat(endpoint: &str, key: &str, model: &str, system: &str, text: &str) ->
 		return Err(crate::Error::Query(format!("the model said {}", res.status())));
 	}
 	let value: serde_json::Value = res.json().map_err(|e| crate::Error::Query(e.to_string()))?;
-	let text = value["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string();
+	// Some endpoints answer with content parts instead of a string.
+	let message = &value["choices"][0]["message"]["content"];
+	let text = match message {
+		serde_json::Value::String(s) => s.clone(),
+		serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join(""),
+		_ => value["choices"][0]["text"].as_str().unwrap_or_default().to_string(),
+	};
+	let text = text.trim().to_string();
 	if text.is_empty() {
-		return Err(crate::Error::Query("the model answered nothing".into()));
+		return Err(crate::Error::Query("the model answered nothing; try again or pick another model".into()));
 	}
 	Ok(text)
 }

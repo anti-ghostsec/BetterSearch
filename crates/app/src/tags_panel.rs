@@ -335,7 +335,19 @@ impl TagsPanel {
 			}
 
 			if filter.is_empty() && !self.recent.is_empty() {
-				heading(ui, "Recent searches");
+				let mut clear = false;
+				ui.horizontal(|ui| {
+					heading(ui, "Recent searches");
+					if ui.small_button("clear").on_hover_text("Forget the search history").clicked() {
+						clear = true;
+					}
+				});
+				if clear {
+					let _ = store.lock().unwrap().clear_history();
+					self.recent.clear();
+					self.usual.clear();
+					self.made_for = (0, 0, 0);
+				}
 				for q in &self.recent {
 					if ui.link(RichText::new(q).monospace().small()).clicked() {
 						actions.push(Action::SetSearch(q.clone()));

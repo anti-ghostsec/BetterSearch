@@ -360,6 +360,10 @@ impl App {
 		if text.is_empty() {
 			return;
 		}
+		if self.settings.taste.model.trim().is_empty() {
+			self.chat_note = Some("Pick a model first (↻ lists them).".into());
+			return;
+		}
 		self.chat_input.clear();
 		self.chat.push((true, text.clone()));
 		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -368,6 +372,16 @@ impl App {
 			taste::build(&store, &self.settings.ratings, now, self.settings.taste.dial_override).ok()
 		};
 		let tags: Vec<String> = profile.as_ref().map(|p| p.tags.iter().take(30).map(|t| t.tag.clone()).collect()).unwrap_or_default();
+		let (groups, link_names) = {
+			let store = self.store.lock().unwrap();
+			let groups = store
+				.groups()
+				.unwrap_or_default()
+				.into_iter()
+				.map(|(name, members)| format!("@{name} = {}", members.join(" ")))
+				.collect::<Vec<_>>();
+			(groups, store.graph().link_names().unwrap_or_default())
+		};
 		let recent: Vec<String> = self
 			.store
 			.lock()
@@ -375,11 +389,15 @@ impl App {
 			.unwrap_or_default();
 		let system = format!(
 			"You guide someone through booru searching. Their taste, from their own favorites and searches: {}. Their brief: {}. \
+			 Their own groups, written as `@name = member member`: [{}]. When a group fits, use `@name` as the tag. \
+			 Link kinds they use: [{}]. A link is written `kind[tag tag]` and matches posts whose tags are linked that way. \
 			 Their recent searches, newest first: [{}]. Don't send them on a search they've already run unless they ask for it again. \
 			 Answer briefly, in plain prose. If a search would help, end with one last line exactly `SEARCH: <query>` using boolean \
 			 syntax (tags ANDed by spaces, `~a ~b` for either, `-tag`, `rating:s|q|e`, `order:score`). Only real tag names.",
 			if tags.is_empty() { "not known yet".to_string() } else { tags.join(", ") },
 			if self.taste_brief.is_empty() { "none yet".to_string() } else { self.taste_brief.clone() },
+			groups.join("; "),
+			link_names.join(", "),
 			recent.join("; "),
 		);
 		let t = &self.settings.taste;
@@ -393,55 +411,73 @@ impl App {
 			let t = &self.settings.taste;
 			self.worker.models(t.endpoint.clone(), t.api_key.clone());
 		}
-		ui.horizontal(|ui| {
-			ui.strong("Guide");
-			let current = if self.settings.taste.model.is_empty() { "pick one".to_string() } else { self.settings.taste.model.clone() };
-			egui::ComboBox::from_id_salt("taste-model").selected_text(current).show_ui(ui, |ui| {
-				for m in self.models.clone() {
-					if ui.selectable_label(self.settings.taste.model == m, &m).clicked() {
-						self.settings.taste.model = m;
-						self.save_settings();
+		let mut clear = false;
+		egui::CollapsingHeader::new("Guide").default_open(true).show(ui, |ui| {
+			// Scrolls, so a short window can still reach the bottom of it.
+			egui::ScrollArea::vertical().max_height(330.0).auto_shrink([false, true]).show(ui, |ui| {
+				ui.horizontal_wrapped(|ui| {
+					let current = if self.settings.taste.model.is_empty() { "pick a model".to_string() } else { self.settings.taste.model.clone() };
+					egui::ComboBox::from_id_salt("taste-model").selected_text(current).width(ui.available_width() - 30.0).show_ui(ui, |ui| {
+						for m in self.models.clone() {
+							if ui.selectable_label(self.settings.taste.model == m, &m).clicked() {
+								self.settings.taste.model = m;
+								self.save_settings();
+							}
+						}
+					});
+					if ui.small_button("↻").on_hover_text("Ask the endpoint for its model list").clicked() {
+						let t = &self.settings.taste;
+						self.chat_note = Some("Asking…".into());
+						self.worker.models(t.endpoint.clone(), t.api_key.clone());
 					}
+				});
+				ui.horizontal_wrapped(|ui| {
+					if ui.small_button("Picks").on_hover_text("Searches built from your own tags, no model involved").clicked() {
+						self.refresh_picks();
+					}
+					if ui.small_button("New brief").clicked() {
+						self.write_brief();
+					}
+					if ui.small_button("Clear").on_hover_text("Empty this conversation").clicked() {
+						clear = true;
+					}
+				});
+				if let Some(n) = &self.chat_note {
+					ui.label(RichText::new(n).weak().small());
+				}
+				if !self.taste_brief.is_empty() {
+					ui.group(|ui| ui.label(RichText::new(&self.taste_brief).italics().small()));
+				}
+				if self.chat.is_empty() {
+					ui.label(
+						RichText::new("Say what you're after — “wolves at night”, “less comic”, “use @animal” — and it points a search at it.")
+							.weak()
+							.small(),
+					);
+				}
+				for (mine, line) in &self.chat {
+					ui.horizontal_wrapped(|ui| {
+						ui.label(RichText::new(if *mine { "you" } else { "guide" }).weak().small());
+						ui.label(line);
+					});
+				}
+				ui.add_space(2.0);
+				let send = ui.add(
+					egui::TextEdit::singleline(&mut self.chat_input)
+						.hint_text("tell it what you want")
+						.desired_width(f32::INFINITY),
+				);
+				let enter = send.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+				if enter || (ui.button("Send").clicked()) {
+					self.send_chat();
+					send.request_focus();
 				}
 			});
-			if ui.button("List models").on_hover_text("Ask the endpoint what it has").clicked() {
-				let t = &self.settings.taste;
-				self.chat_note = Some("Asking…".into());
-				self.worker.models(t.endpoint.clone(), t.api_key.clone());
-			}
-			ui.separator();
-			if ui.button("Picks").on_hover_text("Searches built from your own tags, no model involved").clicked() {
-				self.refresh_picks();
-			}
-			if ui.button("New brief").clicked() {
-				self.write_brief();
-			}
 		});
-		if let Some(n) = &self.chat_note {
-			ui.label(RichText::new(n).weak());
+		if clear {
+			self.chat.clear();
+			self.chat_note = None;
 		}
-		if !self.taste_brief.is_empty() {
-			ui.group(|ui| ui.label(RichText::new(&self.taste_brief).italics()));
-		}
-		egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).show(ui, |ui| {
-			if self.chat.is_empty() {
-				ui.label(RichText::new("Say what you're after — \"something with wolves at night\", \"less comic, more solo\" — and it will point a search at it.").weak());
-			}
-			for (mine, line) in &self.chat {
-				ui.horizontal(|ui| {
-					ui.label(RichText::new(if *mine { "you" } else { "guide" }).weak().small());
-					ui.label(line);
-				});
-			}
-		});
-		ui.horizontal(|ui| {
-			let send = ui.add(egui::TextEdit::singleline(&mut self.chat_input).hint_text("tell it what you want").desired_width(ui.available_width() - 60.0));
-			let enter = send.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-			if ui.button("Send").clicked() || enter {
-				self.send_chat();
-				send.request_focus();
-			}
-		});
 	}
 
 	/// Opens the save dialog for a post, suggesting a name and folder.
