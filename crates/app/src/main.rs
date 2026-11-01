@@ -196,6 +196,8 @@ struct App {
 	brief_calls: Vec<std::time::Instant>,
 	save_dialog: Option<SaveDialog>,
 	models_asked: bool,
+	/// The last query the guide proposed, to vet if it finds nothing.
+	ai_query: Option<String>,
 	/// Thumbnails allowed to start this frame, so a whole page doesn't decode
 	/// and upload in one go.
 	thumb_budget: usize,
@@ -312,6 +314,7 @@ impl App {
 			brief_calls: Vec::new(),
 			save_dialog: None,
 			models_asked: false,
+			ai_query: None,
 			thumb_budget: 16,
 			chat: Vec::new(),
 			chat_input: String::new(),
@@ -377,6 +380,72 @@ impl App {
 		self.urgent = true;
 	}
 
+	/// A search the guide proposed found nothing: drop the tags no ticked site
+	/// has, say which, and try once more. Groups, links and metatags are kept.
+	fn vet_ai_query(&mut self) {
+		let Some(mut asked) = self.ai_query.take() else { return };
+		let sites = self.current_sites();
+		if sites.is_empty() {
+			return;
+		}
+		// A rating none of the sites carry matches nothing there, which reads
+		// as "no results" for the whole search.
+		let allowed: Vec<Rating> = match sites.iter().find_map(|s| s.only_ratings()) {
+			None => Rating::ALL.to_vec(),
+			Some(_) => sites.iter().filter_map(|s| s.only_ratings()).flatten().copied().collect(),
+		};
+		let words: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
+		let kept: Vec<String> = words
+			.iter()
+			.filter(|w| match w.strip_prefix("rating:").and_then(Rating::from_name) {
+				Some(r) => allowed.contains(&r),
+				None => true,
+			})
+			.cloned()
+			.collect();
+		if kept.len() != words.len() {
+			asked = kept.join(" ");
+		}
+		let Ok(expr) = bettersearch_core::parse(&asked) else { return };
+		let mut tags: Vec<String> = Vec::new();
+		expr.walk(&mut |e| {
+			if let bettersearch_core::Expr::Tag(t) = e
+				&& !t.starts_with('@')
+				&& !t.contains(['*', '['])
+				&& !tags.contains(t)
+			{
+				tags.push(t.clone());
+			}
+		});
+		if tags.is_empty() {
+			return;
+		}
+		let dead: Vec<String> = tags
+			.iter()
+			.filter(|tag| {
+				sites.iter().all(|site| {
+					let known = self.store.lock().unwrap().cached_count(site.id(), tag);
+					let count = match known {
+						Some(c) => Some(c),
+						None => site.tag_counts(&[(*tag).clone()]).ok().and_then(|m| m.get(*tag).copied()),
+					};
+					count == Some(0)
+				})
+			})
+			.cloned()
+			.collect();
+		if dead.is_empty() && asked.split_whitespace().count() == words.len() {
+			return;
+		}
+		let trimmed: Vec<&str> = asked.split_whitespace().filter(|w| !dead.iter().any(|d| d == w)).collect();
+		if trimmed.is_empty() {
+			return;
+		}
+		self.chat.push((false, format!("Nothing had {} — dropped {} and tried again.", dead.join(", "), dead.join(", "))));
+		self.query = trimmed.join(" ");
+		self.search();
+	}
+
 	/// Sends the typed chat line to the guide.
 	fn send_chat(&mut self) {
 		let text = self.chat_input.trim().to_string();
@@ -405,18 +474,29 @@ impl App {
 				.collect::<Vec<_>>();
 			(groups, store.graph().link_names().unwrap_or_default())
 		};
+		let where_ = self
+			.current_sites()
+			.iter()
+			.map(|s| match s.only_ratings() {
+				Some(only) => format!("{} ({}) — only {}", s.name(), s.id(), only.iter().map(|r| r.label()).collect::<Vec<_>>().join("/")),
+				None => format!("{} ({})", s.name(), s.id()),
+			})
+			.collect::<Vec<_>>()
+			.join("; ");
 		let recent: Vec<String> = self
 			.store
 			.lock()
 			.map(|s| s.history(12).unwrap_or_default().into_iter().map(|(q, _)| q).collect())
 			.unwrap_or_default();
 		let system = format!(
-			"You guide someone through booru searching. Their taste, from their own favorites and searches: {}. Their brief: {}. \
+			"You guide someone through booru searching. Sites in use: [{}]. Never use a rating a site doesn't carry. \
+			 Their taste, from their own favorites and searches: {}. Their brief: {}. \
 			 Their own groups, written as `@name = member member`: [{}]. When a group fits, use `@name` as the tag. \
 			 Link kinds they use: [{}]. A link is written `kind[tag tag]` and matches posts whose tags are linked that way. \
 			 Their recent searches, newest first: [{}]. Don't send them on a search they've already run unless they ask for it again. \
 			 Answer briefly, in plain prose. If a search would help, end with one last line exactly `SEARCH: <query>` using boolean \
 			 syntax (tags ANDed by spaces, `~a ~b` for either, `-tag`, `rating:s|q|e`, `order:score`). Only real tag names.",
+			where_,
 			if tags.is_empty() { "not known yet".to_string() } else { tags.join(", ") },
 			if self.taste_brief.is_empty() { "none yet".to_string() } else { self.taste_brief.clone() },
 			groups.join("; "),
@@ -748,6 +828,7 @@ impl App {
 					self.notes = notes;
 				}
 				Msg::Posts { generation, posts, done, checked, more } if generation == self.generation => {
+					let came_back_empty = done && posts.is_empty() && self.posts.is_empty();
 					if let Some(id) = self.running_saved {
 						let mut newest: HashMap<String, u64> = HashMap::new();
 						for p in &posts {
@@ -761,6 +842,9 @@ impl App {
 					self.done = done;
 					self.checked = checked;
 					self.busy = more;
+					if came_back_empty && self.ai_query.as_deref() == Some(self.query.trim()) {
+						self.vet_ai_query();
+					}
 					// Still room on screen once this page is in: fetch more, a few times.
 					let shown = (0..self.posts.len()).filter(|&i| self.visible(i)).count();
 					if !more && !done && shown < self.grid_cols * self.grid_rows && self.auto_loads < 3 {
@@ -818,6 +902,7 @@ impl App {
 						// A last line `SEARCH: …` is a search to run.
 						if let Some(q) = text.lines().rev().find_map(|l| l.trim().strip_prefix("SEARCH:")) {
 							self.query = q.trim().trim_matches('`').to_string();
+							self.ai_query = Some(self.query.clone());
 							self.search();
 						}
 					}

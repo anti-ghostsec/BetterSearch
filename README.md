@@ -55,6 +55,10 @@ set — Venice by default — with a plain User-Agent; the key stays in the vaul
 Nothing is sent until you press **Write brief**, and briefs are capped by the
 per-hour limit in the same section.
 
+A search the guide proposes that finds nothing is retried once with the tags no
+ticked site has (and any rating those sites can't carry) removed, and it says
+which. The guide is also told which sites are in use and what ratings they take.
+
 The searches themselves never involve the model: they are built from the tag
 weights locally, so a bad brief can't send you somewhere you don't browse. The
 model only writes prose.

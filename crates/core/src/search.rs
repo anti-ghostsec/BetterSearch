@@ -78,8 +78,9 @@ pub struct Search {
 	pub checked: usize,
 	/// Posts the site has sent so far.
 	fetched: usize,
-	/// Say which tags the site lacks, if it sends nothing at all.
-	check_tags: bool,
+	/// The empty-result note is added once, not every page.
+	named_missing: bool,
+
 }
 
 /// A post with its query's vouched tags counted as on it. Without this, a
@@ -223,7 +224,7 @@ impl Search {
 
 	/// `check_tags`: if the site sends nothing, look up which tags it doesn't
 	/// have, which matters most when one search runs on several sites.
-	pub fn start_with(site: Arc<dyn Site>, text: &str, ratings: &[Rating], store: &Mutex<Store>, check_tags: bool) -> Result<Search> {
+	pub fn start_with(site: Arc<dyn Site>, text: &str, ratings: &[Rating], store: &Mutex<Store>, _check_tags: bool) -> Result<Search> {
 		let mut notes = Vec::new();
 		let (question, mut expr) = {
 			let reading = store.lock().unwrap().read_relations(&parse(text)?)?;
@@ -355,7 +356,7 @@ impl Search {
 			local_done: false,
 			checked: 0,
 			fetched: 0,
-			check_tags,
+			named_missing: false,
 		})
 	}
 
@@ -512,8 +513,11 @@ impl Search {
 				out.push(post);
 			}
 		}
-		if self.check_tags && self.fetched == 0 && !self.plan.local && self.streams.iter().all(|s| s.started) {
-			self.check_tags = false;
+		// Nothing came back at all: name the tags the site has no posts for, so a
+		// dead tag isn't mistaken for a bad search. Counts are cached, and this
+		// only runs on an empty result.
+		if self.fetched == 0 && !self.plan.local && self.streams.iter().all(|s| s.started) && !self.named_missing {
+			self.named_missing = true;
 			self.name_missing_tags(store);
 		}
 		Ok(out)
