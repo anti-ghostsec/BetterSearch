@@ -7,6 +7,7 @@ mod cache;
 mod cookies;
 mod groups;
 mod lock;
+mod login;
 mod media;
 mod settings;
 mod share;
@@ -196,6 +197,7 @@ struct App {
 	brief_calls: Vec<std::time::Instant>,
 	save_dialog: Option<SaveDialog>,
 	models_asked: bool,
+	login: Option<login::Login>,
 	/// The last query the guide proposed, to vet if it finds nothing.
 	ai_query: Option<String>,
 	/// Thumbnails allowed to start this frame, so a whole page doesn't decode
@@ -314,6 +316,7 @@ impl App {
 			brief_calls: Vec::new(),
 			save_dialog: None,
 			models_asked: false,
+			login: None,
 			ai_query: None,
 			thumb_budget: 16,
 			chat: Vec::new(),
@@ -2470,6 +2473,17 @@ impl App {
 					}
 				}
 			});
+			if ui.button("Sign in…").on_hover_text("Opens a browser window for this host, so you can pass its check or log in").clicked() {
+				let host = self.cookie_host.trim().trim_start_matches('.').to_lowercase();
+				if host.is_empty() {
+					self.api_note = Some("Type the host above first.".into());
+				} else {
+					self.login = login::open(&host);
+					if self.login.is_none() {
+						self.api_note = Some("Couldn't open a window; paste the cookie instead.".into());
+					}
+				}
+			}
 			if ui.button("Copy cookies now").on_hover_text("Works whether or not the box above is ticked; needs a Firefox/LibreWolf profile or Wisp's persistent profile").clicked() {
 				let hosts: Vec<String> = self.current_sites().iter().map(|s| cookies::host_of(s.base())).filter(|h| !h.is_empty()).collect();
 				let mut got = 0;
@@ -2835,6 +2849,24 @@ impl App {
 			self.sync_api();
 		}
 		self.thumb_budget = 16;
+		if let Some(window) = &self.login {
+			match window.poll() {
+				login::Outcome::Pending => {}
+				login::Outcome::Done(cookie, ua) => {
+					let host = window.host.clone();
+					bettersearch_core::sites::set_cookie_as(&host, &cookie, &ua);
+					if let Ok(store) = self.store.lock() {
+						let _ = store.set_cookie(&host, &cookie);
+					}
+					self.api_note = Some(format!("Cookies kept for {host}."));
+					self.login = None;
+				}
+				login::Outcome::Failed(e) => {
+					self.api_note = Some(e);
+					self.login = None;
+				}
+			}
+		}
 
 		let ctx = ui.ctx().clone();
 		self.receive(&ctx);

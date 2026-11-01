@@ -1,6 +1,6 @@
 [package]
 name = "bettersearch"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 description = "A desktop booru search with real boolean searches, tags and local learning"
 repository = "https://github.com/anti-ghostsec/BetterSearch"
@@ -18,3 +18,6 @@ chacha20poly1305 = "0.10.1"
 zeroize = "1.9.1"
 libc = "0.2"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+gtk = { version = "0.11", package = "gtk4", features = ["v4_18"] }
+webkit6 = { version = "0.6", features = ["v2_52", "gtk_v4_18"] }
+glib = "0.22"

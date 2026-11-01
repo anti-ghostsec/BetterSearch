@@ -84,7 +84,12 @@ app has the session and the keys, so the caller doesn't need either.
 Rule34.xxx, furry.booru.org, safebooru.donmai.us and every `booru.org` site
 answer an interactive challenge to plain clients.
 
-Open the site once in a browser, then hand its cookie to the app (⚙ Settings →
+**Sign in…** in the same place opens a browser window inside the app: pass the
+check (or log in) there and press Done, and the cookies come back with the
+User-Agent that earned them. Nothing is written by that window; the session is
+ephemeral.
+
+Otherwise, open the site once in a browser, then hand its cookie to the app (⚙ Settings →
 Blocked sites): either **Copy cookies now**, which reads it out of a Firefox or
 LibreWolf profile, or paste the `Cookie` header yourself. The cookie is kept in
 the vault and sent to that host only, and searches work from then on until it
