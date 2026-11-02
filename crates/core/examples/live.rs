@@ -32,10 +32,10 @@ fn main() -> bettersearch_core::Result<()> {
 		let site = &sites[0];
 		let post = site.search(&format!("id:{id}"), None, 1)?.posts.into_iter().next().expect("no such post");
 		println!("#{} tags: {}", post.id, post.tags.join(" "));
-		let (query, tags, posts) = bettersearch_core::similar::find(site.as_ref(), &post, &[Rating::Safe], 12)?;
-		println!("similar, by {}: query {query}", tags.join(", "));
-		for p in &posts {
-			let shared: Vec<&String> = tags.iter().filter(|t| p.has_tag(t)).collect();
+		let found = bettersearch_core::similar::find(site.as_ref(), &post, &[Rating::Safe], 12)?;
+		println!("similar, by {}: query {}", found.by, found.query);
+		for p in &found.posts {
+			let shared: Vec<&String> = found.tags.iter().filter(|t| p.has_tag(t.trim_start_matches('~'))).collect();
 			println!("  #{} shares {:?}", p.id, shared);
 		}
 		match site.other_versions(post.id)? {

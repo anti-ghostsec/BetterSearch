@@ -193,6 +193,10 @@ struct ApiError {
 	reason: Option<String>,
 }
 
+/// Picture-search scores from here up are the same picture (a repost, a resize,
+/// a small edit); below it they're only alike, and mostly not alike at all.
+const SAME_PICTURE: f64 = 80.0;
+
 #[derive(Deserialize)]
 struct RawMatch {
 	#[serde(default)]
@@ -253,6 +257,14 @@ struct RawPost {
 	fav_count: u64,
 	#[serde(default)]
 	sources: Vec<String>,
+	#[serde(default)]
+	relationships: RawRelationships,
+}
+
+/// Where a post sits in its family: edits and variants hang from a parent.
+#[derive(Deserialize, Default)]
+struct RawRelationships {
+	parent_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -435,15 +447,34 @@ impl Site for E621 {
 	/// Estimated from a random sample: the most common tag's share of it, against
 	/// that tag's post count.
 	/// e621's IQDB picture search, by post id (open without a login).
+	/// The post's family first (the parent it hangs from and the parent's other
+	/// children: edits, variants, alternate versions), then copies the picture
+	/// search finds (reposts, resizes).
 	fn other_versions(&self, post_id: u64) -> Result<Option<Vec<Post>>> {
-		let found: Vec<RawMatch> = self.get("/iqdb_queries.json", &[("search[post_id]", post_id.to_string())])?;
-		let mut matches: Vec<(f64, Post)> = found
+		let me: Posts = self.get("/posts.json", &[("tags", format!("id:{post_id}")), ("limit", "1".into())])?;
+		let root = me.posts.first().and_then(|p| p.relationships.parent_id).unwrap_or(post_id);
+		let mut family = format!("~id:{root} ~parent:{root}");
+		if root != post_id {
+			family.push_str(&format!(" ~parent:{post_id}"));
+		}
+		let mut found = self.search(&family, None, 320)?.posts;
+		// The parent, then the rest in the order they were posted.
+		found.sort_by_key(|p| (p.id != root, p.id));
+		let copies = match self.get::<Vec<RawMatch>>("/iqdb_queries.json", &[("search[post_id]", post_id.to_string())]) {
+			Ok(m) => m,
+			Err(e) if found.len() <= 1 => return Err(e),
+			// The family is the better half; it stands without the copies.
+			Err(_) => Vec::new(),
+		};
+		let mut copies: Vec<(f64, Post)> = copies
 			.into_iter()
+			.filter(|m| m.score >= SAME_PICTURE)
 			.filter_map(|m| m.post.map(|w| (m.score, self.iqdb_post(w.posts))))
-			.filter(|(_, p)| p.id != post_id)
 			.collect();
-		matches.sort_by(|a, b| b.0.total_cmp(&a.0));
-		Ok(Some(matches.into_iter().map(|(_, p)| p).collect()))
+		copies.sort_by(|a, b| b.0.total_cmp(&a.0));
+		found.extend(copies.into_iter().map(|(_, p)| p));
+		let mut seen = HashSet::new();
+		Ok(Some(found.into_iter().filter(|p| p.id != post_id && seen.insert(p.id)).collect()))
 	}
 
 	fn only_ratings(&self) -> Option<&'static [Rating]> {
@@ -471,6 +502,11 @@ impl Site for E621 {
 	fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
 		self.cdn_throttle.wait();
 		super::download(&self.client, url)
+	}
+
+	fn fetch_stream(&self, url: &str) -> Result<Box<dyn std::io::Read + Send>> {
+		self.cdn_throttle.wait();
+		super::stream_with(&self.client, url, None)
 	}
 }
 

@@ -90,6 +90,12 @@ pub trait Site: Send + Sync {
 	/// Fetches an image or thumbnail with the site's client.
 	fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>>;
 
+	/// `fetch_bytes`, handed over as it arrives, so a video can start playing
+	/// before it's all here. Where a site doesn't say, it comes all at once.
+	fn fetch_stream(&self, url: &str) -> Result<Box<dyn std::io::Read + Send>> {
+		Ok(Box::new(std::io::Cursor::new(self.fetch_bytes(url)?)))
+	}
+
 	/// What tends to come with a tag, for learning relations. `None` where the
 	/// site can't say cheaply.
 	fn tag_profile(&self, _tag: &str) -> Result<Option<Profile>> {
@@ -223,6 +229,38 @@ pub fn download(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>
 /// own pages. Gelbooru answers anything without one with a redirect to its post
 /// list, so the referer is required there, not a nicety.
 pub fn download_with(client: &reqwest::blocking::Client, url: &str, referer: Option<&str>) -> Result<Vec<u8>> {
+	let res = open_download(client, url, referer)?;
+	let mut out = Vec::new();
+	use std::io::Read;
+	res.take(MAX_DOWNLOAD + 1).read_to_end(&mut out).map_err(|e| crate::Error::Query(format!("download stopped: {e}")))?;
+	if out.len() as u64 > MAX_DOWNLOAD {
+		return Err(crate::Error::Query("the file is too big to load here".into()));
+	}
+	Ok(out)
+}
+
+/// `download_with`, handed over as it arrives. Reading past `MAX_DOWNLOAD` fails.
+pub fn stream_with(client: &reqwest::blocking::Client, url: &str, referer: Option<&str>) -> Result<Box<dyn std::io::Read + Send>> {
+	Ok(Box::new(Capped { inner: open_download(client, url, referer)?, left: MAX_DOWNLOAD }))
+}
+
+/// A download that fails once it brings in more than it may.
+struct Capped<R> {
+	inner: R,
+	left: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Capped<R> {
+	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+		let n = self.inner.read(buf)?;
+		self.left = self.left.checked_sub(n as u64).ok_or_else(|| std::io::Error::other("the file is too big to load here"))?;
+		Ok(n)
+	}
+}
+
+/// The checks every download passes before its body is read: https all the
+/// way, the file and not a web page, and no bigger than it may be.
+fn open_download(client: &reqwest::blocking::Client, url: &str, referer: Option<&str>) -> Result<reqwest::blocking::Response> {
 	if !url.starts_with("https://") {
 		return Err(crate::Error::Query("only https links are downloaded".into()));
 	}
@@ -243,13 +281,7 @@ pub fn download_with(client: &reqwest::blocking::Client, url: &str, referer: Opt
 	if res.content_length().is_some_and(|n| n > MAX_DOWNLOAD) {
 		return Err(crate::Error::Query("the file is too big to load here".into()));
 	}
-	let mut out = Vec::new();
-	use std::io::Read;
-	res.take(MAX_DOWNLOAD + 1).read_to_end(&mut out).map_err(|e| crate::Error::Query(format!("download stopped: {e}")))?;
-	if out.len() as u64 > MAX_DOWNLOAD {
-		return Err(crate::Error::Query("the file is too big to load here".into()));
-	}
-	Ok(out)
+	Ok(res)
 }
 
 /// Keeps requests to one site at least `gap` apart, across threads.

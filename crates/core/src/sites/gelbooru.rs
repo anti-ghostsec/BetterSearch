@@ -46,6 +46,16 @@ pub struct Gelbooru {
 }
 
 impl Gelbooru {
+	/// gelbooru.com's image servers only serve its own pages, so they get a
+	/// `Referer`; other hosts don't need one.
+	fn referer(&self, url: &str) -> Option<String> {
+		let own = url
+			.split_once("//")
+			.and_then(|(_, rest)| rest.split('/').next())
+			.is_some_and(|host| host == "gelbooru.com" || host.ends_with(".gelbooru.com"));
+		own.then(|| format!("{}/", self.base))
+	}
+
 	pub fn safebooru(user_agent: &str) -> Result<Self> {
 		const RATINGS: &[(&str, Rating)] =
 			&[("general", Rating::Safe), ("safe", Rating::Safe), ("questionable", Rating::Questionable)];
@@ -494,12 +504,12 @@ impl Site for Gelbooru {
 	/// own hosts, so nothing else learns where the file came from.
 	fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
 		self.image_throttle.wait();
-		let referer = format!("{}/", self.base);
-		let own = url
-			.split_once("//")
-			.and_then(|(_, rest)| rest.split('/').next())
-			.is_some_and(|host| host == "gelbooru.com" || host.ends_with(".gelbooru.com"));
-		super::download_with(&self.client, url, own.then_some(referer.as_str()))
+		super::download_with(&self.client, url, self.referer(url).as_deref())
+	}
+
+	fn fetch_stream(&self, url: &str) -> Result<Box<dyn std::io::Read + Send>> {
+		self.image_throttle.wait();
+		super::stream_with(&self.client, url, self.referer(url).as_deref())
 	}
 }
 

@@ -56,6 +56,8 @@ fn main() -> eframe::Result {
 				// SAFETY: a plain query on the context eframe has just made current.
 				let _ = RENDERER.set(unsafe { gl.get_parameter_string(eframe::glow::RENDERER) });
 			}
+			// Whether videos can decode on the graphics card, found out before the first one.
+			std::thread::spawn(media::hw_decoder);
 			Ok(Box::new(Root::new(cc.egui_ctx.clone())))
 		}),
 	)
@@ -118,6 +120,8 @@ enum Action {
 	/// Pauses or plays the GIF or video in the large view.
 	TogglePlay,
 	ToggleMute,
+	/// Sets how loud videos play, 0 to 1.
+	SetVolume(f32),
 	/// Jumps the video to this many seconds in.
 	Seek(f64),
 	/// Posts like this one: by shared tags, or (true) other versions of the picture.
@@ -907,6 +911,7 @@ impl App {
 					if self.playing.as_ref().is_some_and(|p| p.url() == url) {
 						self.playing = Some(match video {
 							Ok(mut video) => {
+								video.volume = self.settings.volume;
 								video.play_from(0.0, ctx);
 								Playing::Video { url, video, tex: None, seen: 0 }
 							}
@@ -1179,6 +1184,13 @@ impl App {
 				Action::ToggleMute => {
 					if let Some(Playing::Video { video, .. }) = &mut self.playing {
 						video.toggle_mute(&self.ctx);
+					}
+				}
+				Action::SetVolume(v) => {
+					self.settings.volume = v;
+					self.save_settings();
+					if let Some(Playing::Video { video, .. }) = &mut self.playing {
+						video.set_volume(v, &self.ctx);
 					}
 				}
 				Action::Seek(at) => {
@@ -1521,6 +1533,8 @@ impl App {
 			ui.centered_and_justified(|ui| {
 				ui.label(if self.busy {
 					"Searching…".to_string()
+				} else if let Some(why) = self.notes.first().filter(|_| self.showing.is_some() && self.error.is_none()) {
+					why.clone()
 				} else if self.searched && self.error.is_none() {
 					format!("Nothing matched (checked {} posts).", self.checked)
 				} else if self.error.is_some() {
@@ -1659,23 +1673,7 @@ impl App {
 					} else if response.clicked() {
 						actions.push(Action::Select(i));
 					}
-					response.context_menu(|ui| {
-						if ui.button(if self.favorites.contains(&self.posts[i].key()) { "Remove from favorites" } else { "Add to favorites" }).clicked() {
-							actions.push(Action::ToggleFavorite(i));
-						}
-						if ui.button("Save file").on_hover_text("The full file, not the thumbnail").clicked() {
-							actions.push(Action::Save(i));
-						}
-						if self.share_tool.is_some() && ui.button("Share").on_hover_text("Opens the share box with this file").clicked() {
-							actions.push(Action::Share(i));
-						}
-						if ui.button("View large").clicked() {
-							actions.push(Action::View(i));
-						}
-						if ui.button("Open page").clicked() {
-							actions.push(Action::Open(self.posts[i].page_url.clone()));
-						}
-					});
+					response.context_menu(|ui| self.post_menu(ui, i, true, actions));
 				}
 			});
 			ui.add_space(12.0);
@@ -1704,6 +1702,26 @@ impl App {
 	}
 
 	/// What can be done to all the ticked posts at once, and how the last of it went.
+	/// A post's right-click menu, the same wherever the post is shown.
+	fn post_menu(&self, ui: &mut egui::Ui, i: usize, view_large: bool, actions: &mut Vec<Action>) {
+		let Some(post) = self.posts.get(i) else { return };
+		if ui.button("Save file…").on_hover_text("The full file, not the thumbnail or sample").clicked() {
+			actions.push(Action::Save(i));
+		}
+		if self.share_tool.is_some() && ui.button("Share").on_hover_text("Opens the share box with this file").clicked() {
+			actions.push(Action::Share(i));
+		}
+		if view_large && ui.button("View large").clicked() {
+			actions.push(Action::View(i));
+		}
+		if ui.button("Open page").clicked() {
+			actions.push(Action::Open(post.page_url.clone()));
+		}
+		if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked() {
+			actions.push(Action::ToggleFavorite(i));
+		}
+	}
+
 	fn ticked_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
 		let n = self.ticked.len();
 		let dir = self.download_dir();
@@ -1766,37 +1784,14 @@ impl App {
 					}
 					self.playing = Some(Playing::Loading(file));
 				}
-				self.play(ui, actions);
+				self.play(ui, self.selected, true, actions);
 			} else if let Some(t) = url.as_deref().and_then(|u| self.big_texture(&post.site, u)) {
 				let w = ui.available_width();
 				let size = t.size_vec2();
 				let pic = ui.add(egui::Image::from_texture(&t).fit_to_exact_size(Vec2::new(w, size.y * w / size.x)).sense(Sense::click()));
-				pic.context_menu(|ui| {
-					if ui.button("Save file…").clicked()
-						&& let Some(i) = self.selected
-					{
-						actions.push(Action::Save(i));
-					}
-					if self.share_tool.is_some()
-						&& ui.button("Share").on_hover_text("Opens the share box with this file").clicked()
-						&& let Some(i) = self.selected
-					{
-						actions.push(Action::Share(i));
-					}
-					if ui.button("Open page").clicked() {
-						actions.push(Action::Open(post.page_url.clone()));
-					}
-					if ui.button("View large").clicked()
-						&& let Some(i) = self.selected
-					{
-						actions.push(Action::View(i));
-					}
-					if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked()
-						&& let Some(i) = self.selected
-					{
-						actions.push(Action::ToggleFavorite(i));
-					}
-				});
+				if let Some(i) = self.selected {
+					pic.context_menu(|ui| self.post_menu(ui, i, true, actions));
+				}
 			} else if url.is_some() {
 				ui.spinner();
 			}
@@ -1881,39 +1876,21 @@ impl App {
 					ui.label(RichText::new(format!("{}·{}·{} · {}", post.width, post.height, post.rating.label(), post.created_at)).weak().small());
 				});
 			});
-			info.response.context_menu(|ui| {
-				if ui.button("Save file…").clicked()
-					&& let Some(i) = self.selected
-				{
-					actions.push(Action::Save(i));
-				}
-				if self.share_tool.is_some()
-					&& ui.button("Share").on_hover_text("Opens the share box with this file").clicked()
-					&& let Some(i) = self.selected
-				{
-					actions.push(Action::Share(i));
-				}
-				if ui.button("Open page").clicked() {
-					actions.push(Action::Open(post.page_url.clone()));
-				}
-				if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked()
-					&& let Some(i) = self.selected
-				{
-					actions.push(Action::ToggleFavorite(i));
-				}
-			});
+			if let Some(i) = self.selected {
+				info.response.context_menu(|ui| self.post_menu(ui, i, true, actions));
+			}
 			if let Some(note) = &self.file_note {
 				ui.label(RichText::new(note).weak().small());
 			}
 			ui.horizontal(|ui| {
-				if ui.button("Find similar").on_hover_text("Posts sharing the most telling tags with this one").clicked()
+				if ui.button("Find similar").on_hover_text("The same artist drawing the same characters; when there's nothing else, posts sharing its most telling tags").clicked()
 					&& let Some(i) = self.selected
 				{
 					actions.push(Action::Similar(i, false));
 				}
 				// e621's picture search is open without an account; Danbooru's isn't.
 				if matches!(post.site.as_str(), "e621" | "e926")
-					&& ui.button("Other versions").on_hover_text("Edits, crops and reposts of this picture, from e621's picture search").clicked()
+					&& ui.button("Other versions").on_hover_text("Its parent and children on e621 (edits, variants), and copies e621's picture search finds").clicked()
 					&& let Some(i) = self.selected
 				{
 					actions.push(Action::Similar(i, true));
@@ -2068,20 +2045,7 @@ impl App {
 				}
 			});
 		});
-		bar.response.context_menu(|ui| {
-			if ui.button("Save file").on_hover_text("The full file, not the sample").clicked() {
-				actions.push(Action::Save(i));
-			}
-			if self.share_tool.is_some() && ui.button("Share").on_hover_text("Opens the share box with this file").clicked() {
-				actions.push(Action::Share(i));
-			}
-			if ui.button("Open page").clicked() {
-				actions.push(Action::Open(post.page_url.clone()));
-			}
-			if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked() {
-				actions.push(Action::ToggleFavorite(i));
-			}
-		});
+		bar.response.context_menu(|ui| self.post_menu(ui, i, false, actions));
 		ui.separator();
 		if !self.site_shows(&post.site) {
 			ui.centered_and_justified(|ui| {
@@ -2102,7 +2066,7 @@ impl App {
 				}
 				self.playing = Some(Playing::Loading(file));
 			}
-			self.play(ui, actions);
+			self.play(ui, Some(i), false, actions);
 			return;
 		}
 		let url = if video {
@@ -2131,20 +2095,7 @@ impl App {
 						ui.add(egui::Image::from_texture(&t).fit_to_exact_size(size * scale)).interact(Sense::click())
 					}).inner
 				};
-				pic.context_menu(|ui| {
-					if ui.button("Save file…").clicked() {
-						actions.push(Action::Save(i));
-					}
-					if self.share_tool.is_some() && ui.button("Share").on_hover_text("Opens the share box with this file").clicked() {
-						actions.push(Action::Share(i));
-					}
-					if ui.button("Open page").clicked() {
-						actions.push(Action::Open(post.page_url.clone()));
-					}
-					if ui.button(if self.favorites.contains(&post.key()) { "Remove from favorites" } else { "Add to favorites" }).clicked() {
-						actions.push(Action::ToggleFavorite(i));
-					}
-				});
+				pic.context_menu(|ui| self.post_menu(ui, i, false, actions));
 			}
 			None => {
 				ui.centered_and_justified(|ui| ui.spinner());
@@ -2153,24 +2104,26 @@ impl App {
 	}
 
 	/// Draws the GIF or video in the large view, with its controls.
-	fn play(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+	/// `i` is the post playing, for its right-click menu (`view_large` adds View large to it).
+	fn play(&mut self, ui: &mut egui::Ui, i: Option<usize>, view_large: bool, actions: &mut Vec<Action>) {
 		let actual = self.viewer_actual;
-		let show = |ui: &mut egui::Ui, t: &TextureHandle, room: Vec2| {
+		let show = |ui: &mut egui::Ui, t: &TextureHandle, room: Vec2| -> egui::Response {
 			let size = t.size_vec2();
 			if actual {
-				egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-					ui.add(egui::Image::from_texture(t).fit_to_exact_size(size));
-				});
+				egui::ScrollArea::both()
+					.auto_shrink(false)
+					.show(ui, |ui| ui.add(egui::Image::from_texture(t).fit_to_exact_size(size).sense(Sense::click())))
+					.inner
 			} else {
 				let scale = (room.x / size.x).min(room.y / size.y).min(3.0);
 				ui.allocate_ui(room, |ui| {
-					ui.centered_and_justified(|ui| {
-						ui.add(egui::Image::from_texture(t).fit_to_exact_size(size * scale));
-					});
-				});
+					ui.centered_and_justified(|ui| ui.add(egui::Image::from_texture(t).fit_to_exact_size(size * scale).sense(Sense::click()))).inner
+				})
+				.inner
 			}
 		};
 		let ctx = ui.ctx().clone();
+		let mut pic = None;
 		match &mut self.playing {
 			None => {}
 			Some(Playing::Loading(_)) => {
@@ -2197,7 +2150,7 @@ impl App {
 				}
 				let room = ui.available_size() - Vec2::new(0.0, 28.0);
 				let tex = frames[shown].0.clone();
-				show(ui, &tex, room);
+				pic = Some(show(ui, &tex, room));
 				ui.horizontal(|ui| {
 					if ui.button(if paused.is_some() { "▶" } else { "⏸" }).on_hover_text("Play or pause (Space)").clicked() {
 						actions.push(Action::TogglePlay);
@@ -2210,7 +2163,10 @@ impl App {
 			}
 			Some(Playing::Video { video, tex, seen, .. }) => {
 				if video.ended() && !video.paused {
-					video.play_from(0.0, &ctx);
+					// The end loops to the start; a stop while it's still downloading
+					// (the network stalled) picks up where it was.
+					let at = if video.loaded() { 0.0 } else { video.position() };
+					video.play_from(at, &ctx);
 					*seen = 0;
 				}
 				if let Some((n, img)) = video.frame_after(*seen) {
@@ -2224,7 +2180,7 @@ impl App {
 				}
 				let room = ui.available_size() - Vec2::new(0.0, 32.0);
 				match tex {
-					Some(t) => show(ui, t, room),
+					Some(t) => pic = Some(show(ui, t, room)),
 					None => {
 						ui.allocate_ui(room, |ui| ui.centered_and_justified(|ui| ui.spinner()));
 					}
@@ -2235,16 +2191,28 @@ impl App {
 					}
 					let mut at = video.position();
 					if video.duration > 0.0 {
-						ui.spacing_mut().slider_width = (ui.available_width() - 200.0).max(120.0);
-						let r = ui.add(egui::Slider::new(&mut at, 0.0..=video.duration).show_value(false));
+						ui.spacing_mut().slider_width = (ui.available_width() - 300.0).max(120.0);
+						let r = ui
+							.add_enabled(video.loaded(), egui::Slider::new(&mut at, 0.0..=video.duration).show_value(false))
+							.on_disabled_hover_text("Still downloading: seeking works once it's all here");
 						if r.drag_stopped() || (r.changed() && !r.dragged()) {
 							actions.push(Action::Seek(at));
 						}
 					}
 					ui.label(format!("{} / {}", media::clock(video.position()), media::clock(video.duration)));
+					if !video.loaded() {
+						ui.label(RichText::new("downloading…").weak());
+					}
 					if video.has_audio {
 						if ui.button(if video.muted { "🔇" } else { "🔊" }).on_hover_text("Sound on or off (M)").clicked() {
 							actions.push(Action::ToggleMute);
+						}
+						// The level shows as it's dragged; ffmpeg takes it when let go.
+						ui.spacing_mut().slider_width = 90.0;
+						let r = ui.add(egui::Slider::new(&mut video.volume, 0.0..=1.0).show_value(false));
+						let r = r.on_hover_text(format!("Volume {:.0}%", video.volume * 100.0));
+						if r.drag_stopped() || (r.changed() && !r.dragged()) {
+							actions.push(Action::SetVolume(video.volume));
 						}
 					} else {
 						ui.label(RichText::new("no sound").weak());
@@ -2253,6 +2221,9 @@ impl App {
 				// No timer: each new frame asks for the repaint that shows it, so
 				// the window redraws at the video's own rate.
 			}
+		}
+		if let (Some(pic), Some(i)) = (pic, i) {
+			pic.context_menu(|ui| self.post_menu(ui, i, view_large, actions));
 		}
 	}
 
@@ -2730,14 +2701,26 @@ impl App {
 				}
 				ui.label(RichText::new(format!("Port and token are in {}", settings::data_dir().join("api.json").display())).weak());
 			}
-			if let Some(gpu) = RENDERER.get() {
+			let video = media::hw_decoder_known();
+			if RENDERER.get().is_some() || video.is_some() {
 				ui.add_space(8.0);
 				ui.separator();
 				ui.strong("Graphics");
+			}
+			if let Some(gpu) = RENDERER.get() {
 				ui.label(RichText::new(format!("Drawn on {gpu}")).weak());
 				if gpu.contains("llvmpipe") || gpu.contains("softpipe") {
 					ui.label(RichText::new("That's the processor, not a graphics card: OpenGL found no card it could use.").weak());
 				}
+			}
+			match video {
+				Some(Some(node)) => {
+					ui.label(RichText::new(format!("Videos decode on the graphics card (VA-API, {node})")).weak());
+				}
+				Some(None) => {
+					ui.label(RichText::new("Videos decode on the processor: ffmpeg can't use a graphics card's video decoder (VA-API) here.").weak());
+				}
+				None => {}
 			}
 			ui.add_space(8.0);
 			ui.separator();
@@ -3335,10 +3318,32 @@ mod tests {
 		texts_with(&mut app, &ctx, 1300.0, vec![right(true)]);
 		texts_with(&mut app, &ctx, 1300.0, vec![right(false)]);
 		let menu = shown(&mut app);
-		assert!(menu.iter().any(|t| t == "Save file") && menu.iter().any(|t| t == "Share"), "{menu:?}");
+		assert!(menu.iter().any(|t| t == "Save file…") && menu.iter().any(|t| t == "Share"), "{menu:?}");
 		app.share_tool = None;
 		let menu = shown(&mut app);
-		assert!(menu.iter().any(|t| t == "Save file") && !menu.iter().any(|t| t == "Share"), "{menu:?}");
+		assert!(menu.iter().any(|t| t == "Save file…") && !menu.iter().any(|t| t == "Share"), "{menu:?}");
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Find similar or Other versions finding nothing says why, not just "nothing matched".
+	#[test]
+	fn empty_similar_results_say_why() {
+		let (mut app, ctx, dir) = app_with_posts("why", 0);
+		app.showing = Some("Other versions of #5".into());
+		app.notes = vec!["No other versions of #5 on e926: it has no parent or children there you can see.".into()];
+		app.busy = false;
+		let seen = texts(&mut app, &ctx, 1300.0);
+		assert!(seen.iter().any(|(t, _)| t.starts_with("No other versions of #5")), "{seen:?}");
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// The volume is kept for the next video.
+	#[test]
+	fn volume_is_remembered() {
+		let (mut app, _ctx, dir) = app_with_posts("volume", 1);
+		assert_eq!(app.settings.volume, 1.0);
+		app.apply(vec![super::Action::SetVolume(0.4)]);
+		assert_eq!(app.settings.volume, 0.4);
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
@@ -3451,7 +3456,7 @@ mod tests {
 		app.apply(vec![super::Action::View(0)]);
 		texts(&mut app, &ctx, 1300.0);
 		until_fetch_fails(&mut app, &ctx);
-		let video = super::media::Video::open(&made.stdout).map(Box::new);
+		let video = super::media::Video::stream(Box::new(std::io::Cursor::new(made.stdout))).map(Box::new);
 		app.worker.inject(super::worker::Msg::Video { url, video });
 		let mut seen = Vec::new();
 		for _ in 0..40 {

@@ -283,6 +283,11 @@ impl Site for Moebooru {
 		self.image_throttle.wait();
 		super::download(&self.client, url)
 	}
+
+	fn fetch_stream(&self, url: &str) -> Result<Box<dyn std::io::Read + Send>> {
+		self.image_throttle.wait();
+		super::stream_with(&self.client, url, None)
+	}
 }
 
 #[cfg(test)]

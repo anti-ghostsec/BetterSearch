@@ -49,6 +49,8 @@ pub struct Settings {
 	/// Reuse the browser's clearance cookies for sites that challenge the app.
 	/// Off by default: the app then touches no browser files at all.
 	pub browser_cookies: bool,
+	/// How loud videos play, 0 to 1.
+	pub volume: f32,
 }
 
 /// Which API a site speaks, so the right adapter is built for it.
@@ -181,6 +183,7 @@ impl Default for Settings {
 			api: Api::default(),
 			custom_sites: Vec::new(),
 			browser_cookies: false,
+			volume: 1.0,
 		}
 	}
 }

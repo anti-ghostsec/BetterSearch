@@ -12,13 +12,20 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::egui::{self, ColorImage};
 use image::AnimationDecoder;
 
 /// Frames are scaled down to this width at most.
 const MAX_WIDTH: u32 = 1280;
+/// Bytes of a video downloaded before trying to start it: enough for the
+/// header of anything that can start early. (Tiny in tests, so a small test
+/// video still arrives in pieces.)
+#[cfg(not(test))]
+const START_AFTER: usize = 2 * 1024 * 1024;
+#[cfg(test)]
+const START_AFTER: usize = 8 * 1024;
 /// Animations stop adding frames past this much memory.
 const MAX_ANIMATION_BYTES: usize = 400 * 1024 * 1024;
 
@@ -71,6 +78,53 @@ pub fn can_play_video() -> bool {
 	Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+static HW: OnceLock<Option<String>> = OnceLock::new();
+
+/// The graphics card to decode on: the one programs are pointed at
+/// (`DRI_PRIME=pci-0000_0a_00_0`), else the one the screen started on.
+fn render_node() -> Option<String> {
+	if let Some(p) = std::env::var("DRI_PRIME").ok().and_then(|v| prime_node(&v)).filter(|p| std::path::Path::new(p).exists()) {
+		return Some(p);
+	}
+	let mut nodes: Vec<_> = std::fs::read_dir("/sys/class/drm").ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+	nodes.sort();
+	let first = nodes.into_iter().filter(|n| n.starts_with("renderD")).find(|n| {
+		std::fs::read_to_string(format!("/sys/class/drm/{n}/device/boot_vga")).is_ok_and(|v| v.trim() == "1")
+	})?;
+	Some(format!("/dev/dri/{first}"))
+}
+
+/// The render node `DRI_PRIME=pci-0000_0a_00_0` names: the card at 0000:0a:00.0.
+fn prime_node(prime: &str) -> Option<String> {
+	let parts: Vec<&str> = prime.strip_prefix("pci-")?.split('_').collect();
+	let [dom, bus, dev, func] = parts.as_slice() else { return None };
+	Some(format!("/dev/dri/by-path/pci-{dom}:{bus}:{dev}.{func}-render"))
+}
+
+/// The graphics card's video decoder (VA-API), if ffmpeg can use it here.
+/// Asked once, with a short ffmpeg run; without one, videos decode on the
+/// processor. A codec the card can't do falls back to the processor too.
+pub fn hw_decoder() -> Option<&'static str> {
+	HW.get_or_init(|| {
+		let node = render_node()?;
+		let works = Command::new("ffmpeg")
+			.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-init_hw_device", &format!("vaapi=va:{node}"), "-filter_hw_device", "va"])
+			.args(["-f", "lavfi", "-i", "nullsrc=s=64x64", "-frames:v", "1", "-vf", "format=nv12,hwupload", "-f", "null", "-"])
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status()
+			.is_ok_and(|s| s.success());
+		works.then_some(node)
+	})
+	.as_deref()
+}
+
+/// `hw_decoder`, without waiting: `None` until it has been asked.
+pub fn hw_decoder_known() -> Option<Option<&'static str>> {
+	HW.get().map(|d| d.as_deref())
+}
+
 /// A video held in memory, playing through ffmpeg.
 pub struct Video {
 	/// The RAM-only file holding the video.
@@ -82,6 +136,8 @@ pub struct Video {
 	fps: f64,
 	pub has_audio: bool,
 	pub muted: bool,
+	/// How loud, 0 to 1.
+	pub volume: f32,
 	pub paused: bool,
 	child: Option<Child>,
 	/// Where the current run started, and frames shown since.
@@ -92,20 +148,69 @@ pub struct Video {
 	ended: Arc<AtomicBool>,
 	/// Width and height frames are scaled to.
 	out: (u32, u32),
+	/// Whether all of it has downloaded (or stopped downloading).
+	loaded: Arc<AtomicBool>,
+	/// Tells the download to stop, once nothing wants it.
+	cancel: Arc<AtomicBool>,
+	/// Set to stop handing the current run the video, while it downloads.
+	feeding: Option<Arc<AtomicBool>>,
+	/// Whether the current run decodes on the graphics card, and whether one
+	/// did and showed nothing (then the processor does it from there on).
+	on_card: bool,
+	card_failed: bool,
 }
 
 impl Video {
-	/// Puts the video in a RAM-only file and reads its size, length and streams.
-	pub fn open(bytes: &[u8]) -> Result<Video, String> {
-		// Close-on-exec: only the ffmpeg runs below get it (see `hand_over`).
+	/// Puts a video in a RAM-only file as it downloads, reads its size, length
+	/// and streams, and returns once it can start: after the first couple of
+	/// MB, or after all of it for an MP4 that keeps its index at the end. The
+	/// rest comes in behind it.
+	pub fn stream(mut from: Box<dyn Read + Send>) -> Result<Video, String> {
+		// Asked here, off the window's thread, so playing never waits on it.
+		hw_decoder();
+		let mut v = Video::empty()?;
+		let mut file = v.writer()?;
+		let mut buf = vec![0u8; 64 * 1024];
+		let (mut have, mut done) = (0, false);
+		while have < START_AFTER && !done {
+			let n = from.read(&mut buf).map_err(|e| format!("download stopped: {e}"))?;
+			file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+			have += n;
+			done = n == 0;
+		}
+		if !done && v.probe().is_err() {
+			std::io::copy(&mut from, &mut file).map_err(|e| format!("download stopped: {e}"))?;
+			done = true;
+		}
+		if done {
+			v.loaded.store(true, Ordering::SeqCst);
+			v.probe()?;
+			return Ok(v);
+		}
+		let (loaded, cancel) = (v.loaded.clone(), v.cancel.clone());
+		std::thread::spawn(move || {
+			// A failed download ends here too: what came plays, then it stops.
+			while !cancel.load(Ordering::SeqCst) {
+				match from.read(&mut buf) {
+					Ok(0) | Err(_) => break,
+					Ok(n) if file.write_all(&buf[..n]).is_err() => break,
+					Ok(_) => {}
+				}
+			}
+			loaded.store(true, Ordering::SeqCst);
+		});
+		Ok(v)
+	}
+
+	fn empty() -> Result<Video, String> {
+		// Close-on-exec: only the ffmpeg runs below get it (see `command`).
 		let name = c"bettersearch-video";
 		let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
 		if fd < 0 {
 			return Err(format!("couldn't make a memory file: {}", std::io::Error::last_os_error()));
 		}
 		let file = unsafe { OwnedFd::from_raw_fd(fd) };
-		std::fs::File::from(file.try_clone().map_err(|e| e.to_string())?).write_all(bytes).map_err(|e| e.to_string())?;
-		let mut v = Video {
+		Ok(Video {
 			file,
 			width: 0,
 			height: 0,
@@ -113,6 +218,7 @@ impl Video {
 			fps: 30.0,
 			has_audio: false,
 			muted: true,
+			volume: 1.0,
 			paused: false,
 			child: None,
 			start: 0.0,
@@ -120,9 +226,22 @@ impl Video {
 			latest: Arc::new(Mutex::new(None)),
 			ended: Arc::new(AtomicBool::new(false)),
 			out: (0, 0),
-		};
-		v.probe()?;
-		Ok(v)
+			loaded: Arc::new(AtomicBool::new(false)),
+			cancel: Arc::new(AtomicBool::new(false)),
+			feeding: None,
+			on_card: false,
+			card_failed: false,
+		})
+	}
+
+	/// The memory file, to write the video into.
+	fn writer(&self) -> Result<std::fs::File, String> {
+		Ok(std::fs::File::from(self.file.try_clone().map_err(|e| e.to_string())?))
+	}
+
+	/// Whether all of it has downloaded.
+	pub fn loaded(&self) -> bool {
+		self.loaded.load(Ordering::SeqCst)
 	}
 
 	fn path(&self) -> String {
@@ -144,6 +263,15 @@ impl Video {
 			});
 		}
 		c.stdin(Stdio::null()).stderr(Stdio::null());
+		c
+	}
+
+	/// A command for an ffmpeg handed the video on its stdin while it downloads,
+	/// and allowed to read nothing else (not even the memory file).
+	fn fed_command(&self) -> Command {
+		let mut c = Command::new("ffmpeg");
+		c.args(["-hide_banner", "-loglevel", "error", "-protocol_whitelist", "pipe"]);
+		c.stdin(Stdio::piped()).stderr(Stdio::null());
 		c
 	}
 
@@ -182,27 +310,60 @@ impl Video {
 	/// frames here and the sound to the speakers.
 	pub fn play_from(&mut self, at: f64, ctx: &egui::Context) {
 		self.stop();
+		if self.on_card && self.ended.load(Ordering::SeqCst) && self.frames.load(Ordering::SeqCst) == 0 {
+			self.card_failed = true;
+		}
 		self.paused = false;
 		self.start = at.max(0.0);
 		self.frames.store(0, Ordering::SeqCst);
 		self.ended.store(false, Ordering::SeqCst);
 		let (w, h) = self.out;
-		let mut cmd = self.command("ffmpeg");
+		// Still downloading, ffmpeg reads it from a pipe as it comes. From the
+		// file it would look for the index at the end (where WebMs keep it)
+		// and wait there until it all arrived.
+		let fed = !self.loaded();
+		let mut cmd = if fed { self.fed_command() } else { self.command("ffmpeg") };
 		// A thread or two, not one per core: by itself ffmpeg spreads even a
 		// small video over every core, a load that makes some computers' screens
 		// glitch. Two keep up with HD, four with anything bigger.
 		let threads = if self.width > 1920 { "4" } else { "2" };
 		cmd.args(["-nostdin", "-filter_threads", "1", "-threads", threads]);
-		cmd.args(["-ss", &format!("{:.3}", self.start), "-re", "-i"]).arg(self.path());
-		cmd.args(["-map", "0:v:0", "-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]);
+		// The graphics card decodes, where it can; frames come back to memory for scaling.
+		self.on_card = false;
+		if let Some(Some(node)) = hw_decoder_known().filter(|_| !self.card_failed) {
+			cmd.args(["-hwaccel", "vaapi", "-hwaccel_device", node]);
+			self.on_card = true;
+		}
+		let at = format!("{:.3}", self.start);
+		// A pipe can't seek (and ffmpeg loses frames trying), so from one it
+		// reads from the top, the part before `start` in a burst, and each
+		// output drops what comes before it.
+		let skip: &[&str] = if fed && self.start > 0.0 { &["-ss", &at] } else { &[] };
+		if fed {
+			if self.start > 0.0 {
+				cmd.args(["-readrate_initial_burst", &at]);
+			}
+			cmd.args(["-re", "-i", "pipe:0"]);
+		} else {
+			cmd.args(["-ss", &at, "-re", "-i"]).arg(self.path());
+		}
+		cmd.args(["-map", "0:v:0"]).args(skip);
+		cmd.args(["-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]);
 		if self.has_audio && !self.muted {
-			cmd.args(["-map", "0:a:0"]);
+			// Squared, so the slider's middle sounds half as loud rather than nearly as loud.
+			cmd.args(["-map", "0:a:0"]).args(skip).args(["-af", &format!("volume={:.3}", self.volume * self.volume)]);
 			cmd.args(sound_output());
 		}
 		let Ok(mut child) = cmd.stdout(Stdio::piped()).spawn() else {
 			self.ended.store(true, Ordering::SeqCst);
 			return;
 		};
+		if fed && let (Some(to), Ok(file)) = (child.stdin.take(), self.writer()) {
+			let over = Arc::new(AtomicBool::new(false));
+			self.feeding = Some(over.clone());
+			let loaded = self.loaded.clone();
+			std::thread::spawn(move || feed(file, to, loaded, over));
+		}
 		let mut out = child.stdout.take().expect("piped");
 		let (latest, frames, ended, ctx) = (self.latest.clone(), self.frames.clone(), self.ended.clone(), ctx.clone());
 		std::thread::spawn(move || {
@@ -255,7 +416,21 @@ impl Video {
 		}
 	}
 
+	/// Sets how loud (0 to 1) and turns the sound on; playing, it goes on from
+	/// where it is at the new level (ffmpeg takes the level when it starts).
+	pub fn set_volume(&mut self, volume: f32, ctx: &egui::Context) {
+		self.volume = volume.clamp(0.0, 1.0);
+		self.muted = false;
+		if !self.paused {
+			let at = self.position();
+			self.play_from(at, ctx);
+		}
+	}
+
 	fn stop(&mut self) {
+		if let Some(over) = self.feeding.take() {
+			over.store(true, Ordering::SeqCst);
+		}
 		if let Some(mut c) = self.child.take() {
 			let _ = c.kill();
 			let _ = c.wait();
@@ -265,7 +440,28 @@ impl Video {
 
 impl Drop for Video {
 	fn drop(&mut self) {
+		self.cancel.store(true, Ordering::SeqCst);
 		self.stop();
+	}
+}
+
+/// Hands ffmpeg the video as it downloads: what's in the memory file, then
+/// what arrives, then the end once it's all there. Reads by position, so the
+/// download's own place in the file is left alone.
+fn feed(file: std::fs::File, mut to: std::process::ChildStdin, loaded: Arc<AtomicBool>, over: Arc<AtomicBool>) {
+	use std::os::unix::fs::FileExt;
+	let mut buf = vec![0u8; 64 * 1024];
+	let mut at = 0;
+	while !over.load(Ordering::SeqCst) {
+		// Checked before reading: then nothing read means nothing more coming.
+		let all = loaded.load(Ordering::SeqCst);
+		match file.read_at(&mut buf, at) {
+			Ok(0) if all => break,
+			Ok(0) => std::thread::sleep(std::time::Duration::from_millis(20)),
+			Ok(n) if to.write_all(&buf[..n]).is_ok() => at += n as u64,
+			// ffmpeg was stopped, or the file can't be read.
+			_ => break,
+		}
 	}
 }
 
@@ -304,6 +500,87 @@ mod tests {
 		assert!(decode_animation(b"not an image").is_err());
 	}
 
+	#[test]
+	fn finds_the_card_programs_are_pointed_at() {
+		assert_eq!(prime_node("pci-0000_0a_00_0").as_deref(), Some("/dev/dri/by-path/pci-0000:0a:00.0-render"));
+		assert_eq!(prime_node("1"), None);
+		assert_eq!(prime_node("pci-0000_0a_00"), None);
+	}
+
+	/// A slow download: a few KB at a time, 20 ms apart.
+	struct Trickle {
+		bytes: Vec<u8>,
+		at: usize,
+		finished: Arc<AtomicBool>,
+	}
+
+	impl Read for Trickle {
+		fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+			if self.at == self.bytes.len() {
+				self.finished.store(true, Ordering::SeqCst);
+				return Ok(0);
+			}
+			std::thread::sleep(std::time::Duration::from_millis(20));
+			let n = buf.len().min(4096).min(self.bytes.len() - self.at);
+			buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+			self.at += n;
+			Ok(n)
+		}
+	}
+
+	/// A video starts before it has all arrived, plays on as the rest comes in,
+	/// and ends at its end. Skipped where ffmpeg isn't installed.
+	#[test]
+	fn plays_a_video_while_it_downloads() {
+		if !can_play_video() {
+			return;
+		}
+		// Written to a file, so it says how long it is, as site videos do.
+		let dir = std::env::temp_dir().join(format!("bs-stream-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("v.webm");
+		let made = Command::new("ffmpeg")
+			.args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=3"])
+			.args(["-vf", "noise=alls=40:allf=t", "-c:v", "libvpx", "-b:v", "800k", "-threads", "2"])
+			.arg(&path)
+			.stdin(Stdio::null())
+			.status()
+			.unwrap();
+		if !made.success() {
+			return;
+		}
+		let bytes = std::fs::read(&path).unwrap();
+		std::fs::remove_dir_all(&dir).unwrap();
+		assert!(bytes.len() > 4 * START_AFTER, "too small to arrive in pieces: {}", bytes.len());
+		let finished = Arc::new(AtomicBool::new(false));
+		let mut v = Video::stream(Box::new(Trickle { bytes, at: 0, finished: finished.clone() })).unwrap();
+		assert!(!v.loaded() && !finished.load(Ordering::SeqCst), "it waited for the whole file");
+		assert_eq!((v.width, v.height), (320, 240));
+		v.play_from(0.0, &egui::Context::default());
+		let t = std::time::Instant::now();
+		let (mut first, mut resumed) = (None, None);
+		while !v.ended() && t.elapsed().as_secs() < 15 {
+			std::thread::sleep(std::time::Duration::from_millis(20));
+			if first.is_none() && v.frame_after(0).is_some() {
+				first = Some((t.elapsed(), v.loaded()));
+			}
+			// Paused and played again mid-download, it goes on from where it was.
+			if resumed.is_none() && !v.loaded() && v.position() >= 0.5 {
+				let ctx = egui::Context::default();
+				v.toggle_pause(&ctx);
+				v.toggle_pause(&ctx);
+				resumed = Some(v.start);
+			}
+		}
+		assert!(v.loaded() && v.ended());
+		// The first frame came while it was still downloading, and the end came at the end.
+		assert!(first.is_some_and(|(_, loaded)| !loaded), "first frame at {first:?}");
+		assert!(t.elapsed().as_secs_f64() < 5.0, "{:?}", t.elapsed());
+		let from = resumed.expect("it was still downloading half a second in");
+		let (n, _) = v.frame_after(0).expect("frames came");
+		assert!(from >= 0.5 && from + n as f64 / 10.0 >= 2.8, "went on from {from}, for {n} frames");
+	}
+
 	/// A one-second test video made by ffmpeg plays here: it's read from memory,
 	/// and frames of the right size come back. Skipped where ffmpeg isn't installed.
 	#[test]
@@ -321,7 +598,7 @@ mod tests {
 		if !made.status.success() {
 			return;
 		}
-		let mut v = Video::open(&made.stdout).unwrap();
+		let mut v = Video::stream(Box::new(Cursor::new(made.stdout))).unwrap();
 		assert_eq!((v.width, v.height, v.has_audio), (320, 240, false));
 		// A webm streamed out of ffmpeg has no length written in it; site videos do.
 		assert!(v.duration == 0.0 || (v.duration - 1.0).abs() < 0.2, "{}", v.duration);

@@ -258,10 +258,12 @@ impl Worker {
 	pub fn media(&self, site: Arc<dyn Site>, url: String, video: bool) {
 		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
 		std::thread::spawn(move || {
-			let bytes = site.fetch_bytes(&url).map_err(|e| e.to_string());
+			// A video starts once its first part is in; the rest follows.
 			let msg = if video {
-				Msg::Video { url, video: bytes.and_then(|b| Video::open(&b)).map(Box::new) }
+				let video = site.fetch_stream(&url).map_err(|e| e.to_string()).and_then(Video::stream);
+				Msg::Video { url, video: video.map(Box::new) }
 			} else {
+				let bytes = site.fetch_bytes(&url).map_err(|e| e.to_string());
 				Msg::Animation { url, frames: bytes.and_then(|b| media::decode_animation(&b)) }
 			};
 			let _ = tx.send(msg);
@@ -376,17 +378,23 @@ fn similar(site: &dyn Site, post: &Post, ratings: &[Rating], versions: bool, sto
 			Some(posts) => {
 				let posts: Vec<Post> = posts.into_iter().filter(|p| ratings.contains(&p.rating)).collect();
 				let note = if posts.is_empty() {
-					format!("{}'s picture search found no other versions of #{}.", site.name(), post.id)
+					format!(
+						"No other versions of #{} on {}: it has no parent or children there you can see, and its picture search found no copies.",
+						post.id,
+						site.name()
+					)
 				} else {
-					format!("Other versions of #{} (edits, crops, reposts), from {}'s picture search.", post.id, site.name())
+					format!("Other versions of #{}: its parent and the parent's other children on {} (edits, variants), then copies its picture search found.", post.id, site.name())
 				};
 				Ok((format!("picture search: #{}", post.id), note, posts))
 			}
 			None => Err(format!("{} has no picture search this app can use.", site.name())),
 		})
 	} else {
-		bettersearch_core::similar::find(site, post, ratings, 60).map(|(query, tags, posts)| {
-			Ok((query, format!("Posts sharing the most telling tags with #{}, searched by: {}.", post.id, tags.join(", ")), posts))
+		bettersearch_core::similar::find(site, post, ratings, 60).map(|found| {
+			let tags = found.tags.iter().map(|t| t.trim_start_matches('~')).collect::<Vec<_>>().join(", ");
+			let note = if tags.is_empty() { format!("Posts like #{}: {}.", post.id, found.by) } else { format!("Posts like #{}: {} ({tags}).", post.id, found.by) };
+			Ok((found.query, note, found.posts))
 		})
 	};
 	match found {

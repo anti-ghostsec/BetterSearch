@@ -438,6 +438,11 @@ impl Site for Danbooru {
 		self.cdn_throttle.wait();
 		super::download(&self.client, url)
 	}
+
+	fn fetch_stream(&self, url: &str) -> Result<Box<dyn std::io::Read + Send>> {
+		self.cdn_throttle.wait();
+		super::stream_with(&self.client, url, None)
+	}
 }
 
 #[cfg(test)]
