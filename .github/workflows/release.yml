@@ -18,17 +18,25 @@ concurrency:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    # The sign-in window needs GTK 4.18 and WebKitGTK 2.52, newer than Ubuntu
+    # LTS has; Debian 13 has both.
+    container: debian:trixie
     steps:
-      - uses: actions/checkout@v4
-
+      # eframe needs the X11 and GL headers even for a headless build, and the
+      # sign-in window GTK's and WebKit's. Before checkout, so it can use git.
       - name: Libraries
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libxkbcommon-dev libxcb1-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev libgl1-mesa-dev
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends ca-certificates curl git build-essential pkgconf \
+            libxkbcommon-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libwayland-dev libgl1-mesa-dev libgtk-4-dev libwebkitgtk-6.0-dev
+
+      - uses: actions/checkout@v4
 
       - name: Toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
 
