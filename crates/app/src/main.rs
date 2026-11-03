@@ -39,6 +39,10 @@ type LoginCheck = (String, Result<String, String>);
 /// Matching posts asked for per page.
 const PAGE: usize = 60;
 const THUMB: f32 = 150.0;
+/// Loaded textures kept before ones not drawn lately are let go.
+const MAX_TEXTURES: usize = 300;
+/// How many frames a texture may go undrawn before it can be let go.
+const TEXTURE_IDLE_FRAMES: u64 = 30;
 
 fn main() -> eframe::Result {
 	let options = eframe::NativeOptions {
@@ -243,6 +247,9 @@ struct App {
 	queries: Vec<String>,
 	notes: Vec<String>,
 	textures: HashMap<String, Tex>,
+	/// The frame each texture was last asked for, for `evict_textures`.
+	texture_used: HashMap<String, u64>,
+	frame: u64,
 	suggestions: Vec<TagSuggestion>,
 	suggest_word: String,
 	selected: Option<usize>,
@@ -316,8 +323,11 @@ impl App {
 		let store = Arc::new(Mutex::new(store));
 		let favorites = store.lock().unwrap().favorite_keys().unwrap_or_default();
 		let taste_brief = store.lock().unwrap().value("taste_brief").ok().flatten().unwrap_or_default();
-		for (host, header, _) in store.lock().unwrap().cookies().unwrap_or_default() {
-			bettersearch_core::sites::set_cookie(&host, &header);
+		for (host, header, ua, _) in store.lock().unwrap().cookies().unwrap_or_default() {
+			match ua.as_str() {
+				"" => bettersearch_core::sites::set_cookie(&host, &header),
+				ua => bettersearch_core::sites::set_cookie_as(&host, &header, ua),
+			}
 		}
 		let worker = Worker::spawn(ctx.clone(), store.clone());
 		App {
@@ -362,6 +372,8 @@ impl App {
 			queries: Vec::new(),
 			notes: Vec::new(),
 			textures: HashMap::new(),
+			texture_used: HashMap::new(),
+			frame: 0,
 			suggestions: Vec::new(),
 			suggest_word: String::new(),
 			selected: None,
@@ -763,7 +775,7 @@ impl App {
 		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
 		let known: std::collections::HashMap<String, i64> = {
 			let store = self.store.lock().unwrap();
-			store.cookies().unwrap_or_default().into_iter().map(|(h, _, at)| (h, at)).collect()
+			store.cookies().unwrap_or_default().into_iter().map(|(h, _, _, at)| (h, at)).collect()
 		};
 		let hosts: Vec<String> = sites
 			.iter()
@@ -971,6 +983,12 @@ impl App {
 
 	/// An image's texture, fetched with the client of the site it's from.
 	fn texture(&mut self, site: &str, url: &str) -> Option<&TextureHandle> {
+		match self.texture_used.get_mut(url) {
+			Some(at) => *at = self.frame,
+			None => {
+				self.texture_used.insert(url.to_string(), self.frame);
+			}
+		}
 		if !self.textures.contains_key(url) {
 			if self.thumb_budget > 0
 				&& let Some(site) = self.site_by_id(site)
@@ -985,6 +1003,21 @@ impl App {
 			Some(Tex::Ready(t)) => Some(t),
 			_ => None,
 		}
+	}
+
+	/// Lets go of loaded textures not drawn for a while, once there are more
+	/// than `MAX_TEXTURES`: scrolling through a long search otherwise keeps
+	/// every thumbnail since unlock in graphics memory.
+	fn evict_textures(&mut self) {
+		self.frame += 1;
+		if self.textures.len() <= MAX_TEXTURES {
+			return;
+		}
+		let cutoff = self.frame.saturating_sub(TEXTURE_IDLE_FRAMES);
+		let (used, big) = (&self.texture_used, &self.big_textures);
+		self.textures.retain(|url, t| !matches!(t, Tex::Ready(_)) || used.get(url).is_some_and(|at| *at >= cutoff) || big.contains(url));
+		let textures = &self.textures;
+		self.texture_used.retain(|url, _| textures.contains_key(url));
 	}
 
 	/// A big image's texture; only the last few big ones stay in memory.
@@ -1560,9 +1593,12 @@ impl App {
 					let site = self.posts[i].site.clone();
 					// Gelbooru refuses apps its images; don't ask for them.
 					let url = self.posts[i].preview_url.clone().filter(|_| self.site_shows(&site));
-					let tex = url.as_deref().and_then(|u| self.texture(&site, u)).cloned();
-					let failed = url.as_deref().is_some_and(|u| matches!(self.textures.get(u), Some(Tex::Failed)));
 					let (rect, response) = ui.allocate_exact_size(Vec2::splat(THUMB), Sense::click());
+					// Only thumbnails on screen (or a couple of rows off it) are fetched
+					// and kept; the rest are let go once there are many.
+					let near = ui.is_rect_visible(rect.expand(2.0 * THUMB));
+					let tex = url.as_deref().filter(|_| near).and_then(|u| self.texture(&site, u)).cloned();
+					let failed = url.as_deref().is_some_and(|u| matches!(self.textures.get(u), Some(Tex::Failed)));
 					let painter = ui.painter_at(rect);
 					painter.rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
 					match &tex {
@@ -2162,7 +2198,10 @@ impl App {
 				}
 			}
 			Some(Playing::Video { video, tex, seen, .. }) => {
-				if video.ended() && !video.paused {
+				// One that can't be decoded isn't restarted on every repaint.
+				if video.broken() {
+					ui.label(RichText::new("ffmpeg keeps stopping before the first frame, so it isn't started again. “Open file” plays it elsewhere.").weak());
+				} else if video.ended() && !video.paused {
 					// The end loops to the start; a stop while it's still downloading
 					// (the network stalled) picks up where it was.
 					let at = if video.loaded() { 0.0 } else { video.position() };
@@ -2489,7 +2528,7 @@ impl App {
 					} else {
 						bettersearch_core::sites::set_cookie(&host, &header);
 						if let Ok(store) = self.store.lock() {
-							let _ = store.set_cookie(&host, &header);
+							let _ = store.set_cookie(&host, &header, bettersearch_core::sites::firefox_ua());
 						}
 						self.cookie_text.clear();
 					}
@@ -2512,7 +2551,7 @@ impl App {
 				for (host, header, ua, _) in cookies::harvest(&hosts) {
 					bettersearch_core::sites::set_cookie_as(&host, &header, &ua);
 					if let Ok(store) = self.store.lock() {
-						let _ = store.set_cookie(&host, &header);
+						let _ = store.set_cookie(&host, &header, &ua);
 					}
 					got += 1;
 				}
@@ -2634,8 +2673,11 @@ impl App {
 				ui.horizontal(|ui| {
 					ui.label("Port (0 picks a free one)");
 					let mut port = self.settings.api.port;
-					if ui.add(egui::DragValue::new(&mut port).range(1024..=65535)).changed() {
-						self.settings.api.port = port;
+					// 0 has to be in range: egui pulls a value outside it in on sight,
+					// which turned the default 0 into 1024 the first time this showed.
+					if ui.add(egui::DragValue::new(&mut port).range(0..=65535)).changed() {
+						// Ports below 1024 need root.
+						self.settings.api.port = if port == 0 { 0 } else { port.max(1024) };
 						self.save_settings();
 						self.sync_api();
 					}
@@ -2892,6 +2934,12 @@ impl App {
 			self.sync_api();
 		}
 		self.thumb_budget = 16;
+		self.evict_textures();
+		// A GIF or video still downloading for a post left behind stops.
+		self.worker.want_media(match &self.playing {
+			Some(Playing::Loading(url)) => Some(url.as_str()),
+			_ => None,
+		});
 		if let Some(window) = &self.login {
 			match window.poll() {
 				login::Outcome::Pending => {}
@@ -2899,7 +2947,7 @@ impl App {
 					let host = window.host.clone();
 					bettersearch_core::sites::set_cookie_as(&host, &cookie, &ua);
 					if let Ok(store) = self.store.lock() {
-						let _ = store.set_cookie(&host, &cookie);
+						let _ = store.set_cookie(&host, &cookie, &ua);
 					}
 					self.api_note = Some(format!("Cookies kept for {host}."));
 					self.login = None;
@@ -3344,6 +3392,18 @@ mod tests {
 		assert_eq!(app.settings.volume, 1.0);
 		app.apply(vec![super::Action::SetVolume(0.4)]);
 		assert_eq!(app.settings.volume, 0.4);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Showing Settings leaves the API port at 0 ("pick a free one"): egui used
+	/// to pull it up to the bottom of the field's range, 1024, on sight.
+	#[test]
+	fn the_api_port_can_stay_free() {
+		let (mut app, ctx, dir) = app_with_posts("port", 1);
+		app.settings.api.enabled = true;
+		app.settings_open = true;
+		texts(&mut app, &ctx, 1300.0);
+		assert_eq!(app.settings.api.port, 0);
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 

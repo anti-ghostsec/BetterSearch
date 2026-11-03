@@ -56,21 +56,26 @@ impl Realbooru {
 	}
 
 	/// Our rating terms become the site's names; everything else is left alone.
+	/// `-rating:e` (what two ticked ratings become) means every other rating:
+	/// the site can't be asked for "not explicit", so it's asked for each of the rest.
 	fn split_ratings(&self, query: &str) -> (String, Vec<(&'static str, Rating)>) {
 		let mut keep = Vec::new();
-		let mut wanted: Vec<(&'static str, Rating)> = Vec::new();
+		let (mut yes, mut no): (Vec<Rating>, Vec<Rating>) = (Vec::new(), Vec::new());
 		for word in query.split_whitespace() {
-			let Some(v) = word.strip_prefix("rating:") else {
+			let (negated, rest) = match word.strip_prefix('-') {
+				Some(rest) => (true, rest),
+				None => (false, word),
+			};
+			let Some(rating) = rest.strip_prefix("rating:").and_then(Rating::from_name) else {
 				keep.push(word.to_string());
 				continue;
 			};
-			let want = Rating::from_name(v);
-			for (name, rating) in RATINGS {
-				if want.is_some_and(|w| w == *rating) && !wanted.iter().any(|(n, _)| n == name) {
-					wanted.push((name, *rating));
-				}
-			}
+			if negated { no.push(rating) } else { yes.push(rating) }
 		}
+		if yes.is_empty() && !no.is_empty() {
+			yes = Rating::ALL.to_vec();
+		}
+		let wanted = RATINGS.iter().filter(|(_, r)| yes.contains(r) && !no.contains(r)).copied().collect();
 		(keep.join(" "), wanted)
 	}
 
@@ -297,6 +302,14 @@ mod tests {
 		let (tags, wanted) = site.split_ratings("fox");
 		assert_eq!(tags, "fox");
 		assert!(wanted.is_empty());
+		// Safe and Questionable ticked: the app sends `-rating:e`.
+		let (tags, wanted) = site.split_ratings("fox -rating:e");
+		assert_eq!(tags, "fox");
+		assert_eq!(wanted, vec![("safe", Rating::Safe), ("questionable", Rating::Questionable)]);
+		let (_, wanted) = site.split_ratings("-rating:q fox");
+		assert_eq!(wanted, vec![("safe", Rating::Safe), ("explicit", Rating::Explicit)]);
+		// A negated tag that isn't a rating stays a tag.
+		assert_eq!(site.split_ratings("fox -wolf").0, "fox -wolf");
 	}
 
 	/// Live, since most of this is parsing a real page.

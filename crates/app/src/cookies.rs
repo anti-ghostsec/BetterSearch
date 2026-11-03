@@ -85,6 +85,17 @@ fn wisp_ua() -> String {
 	set.unwrap_or_else(|| "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15".into())
 }
 
+/// A new, empty folder with mode 0700. Created, never reused: if the name is
+/// taken (someone else made it first), there's no copy at all.
+fn private_dir() -> Option<PathBuf> {
+	use std::os::unix::fs::DirBuilderExt;
+	let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+	let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+	let dir = base.join(format!("bs-web-{}-{nanos:08x}", std::process::id()));
+	std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
+	Some(dir)
+}
+
 /// Cookies for a host out of a WebKit store. If the immutable open finds none
 /// (recent cookies may still be in the WAL), the files are copied aside first.
 fn from_webkit(db: &Path, host: &str) -> String {
@@ -100,13 +111,17 @@ fn from_webkit(db: &Path, host: &str) -> String {
 			return pairs(rows);
 		}
 	}
-	// Copy the set aside so a running browser's WAL is seen too.
-	let which = db.parent().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy().into_owned();
-	let tmp = std::env::temp_dir().join(format!("bs-web-{}-{which}", std::process::id()));
-	let _ = std::fs::create_dir_all(&tmp);
+	// Recent cookies may only be in the WAL; with none there, nothing is newer.
+	let wal = PathBuf::from(format!("{}-wal", db.display()));
+	if !std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+		return String::new();
+	}
+	// Copy the set aside so the WAL is read too. The copy holds every site's
+	// cookies, so it goes in a fresh folder only this user can open, in RAM
+	// when the session has a runtime directory, and is removed straight after.
+	let Some(tmp) = private_dir() else { return String::new() };
 	let copied = tmp.join("cookies.db");
-	let ok = std::fs::copy(db, &copied).is_ok()
-		&& std::fs::copy(format!("{}-wal", db.display()), format!("{}-wal", copied.display())).is_ok();
+	let ok = std::fs::copy(db, &copied).is_ok() && std::fs::copy(&wal, tmp.join("cookies.db-wal")).is_ok();
 	let rows = if ok {
 		Connection::open(&copied).ok().map(|c| read(&c)).unwrap_or_default()
 	} else {
@@ -187,6 +202,30 @@ mod tests {
 		drop(conn);
 		assert_eq!(from_webkit(&db, "x.test"), "cf_clearance=abc");
 		assert_eq!(from_webkit(&db, "nothing.test"), "");
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// A cookie still in the WAL of a running browser is found through a
+	/// private copy, and the copy is gone afterwards.
+	#[test]
+	fn reads_a_cookie_still_in_the_wal() {
+		let dir = std::env::temp_dir().join(format!("bs-webkit-wal-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let db = dir.join("cookies.db");
+		let conn = Connection::open(&db).unwrap();
+		conn.execute_batch(
+			"PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+			 CREATE TABLE cookies (name TEXT, value TEXT, domain TEXT, path TEXT);
+			 INSERT INTO cookies VALUES ('cf_clearance','fresh','.wal.test','/');",
+		)
+		.unwrap();
+		assert!(std::fs::metadata(dir.join("cookies.db-wal")).unwrap().len() > 0);
+		assert_eq!(from_webkit(&db, "wal.test"), "cf_clearance=fresh");
+		let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+		let prefix = format!("bs-web-{}-", std::process::id());
+		let left = std::fs::read_dir(base).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&prefix)).count();
+		assert_eq!(left, 0, "the private copy was left behind");
+		drop(conn);
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 

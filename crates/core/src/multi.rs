@@ -125,8 +125,8 @@ impl MultiSearch {
 	}
 
 	/// Up to about `want` more posts, shared out between the sites still going.
-	/// A site that fails part way is dropped (and named in `problems`) while
-	/// others carry on; with one site, its error comes back as is.
+	/// A site that fails twice in a row is dropped (and named in `problems`)
+	/// while others carry on; with one site, its error comes back as is.
 	pub fn next(&mut self, want: usize, store: &Mutex<Store>) -> Result<Vec<Post>> {
 		let active = self.searches.iter().filter(|s| !s.done()).count();
 		if active == 0 {
@@ -137,11 +137,21 @@ impl MultiSearch {
 		let found = each(&mut self.searches, |s| if s.done() { None } else { Some(s.next(share, store)) });
 		let mut batches = Vec::new();
 		let mut failed = Vec::new();
+		let mut errors = Vec::new();
 		for (i, found) in found.into_iter().enumerate() {
 			match found {
 				None => {}
-				Some(Ok(posts)) => batches.push(posts.into_iter()),
+				Some(Ok(posts)) => {
+					self.searches[i].strikes = 0;
+					batches.push(posts.into_iter());
+				}
 				Some(Err(e)) if !several => return Err(e),
+				// One timeout or busy answer isn't the end of a site: it's asked
+				// again next time, and only dropped if that fails too.
+				Some(Err(e)) if self.searches[i].strikes == 0 => {
+					self.searches[i].strikes = 1;
+					errors.push(format!("{}: {e}", self.searches[i].site().name()));
+				}
 				Some(Err(e)) => {
 					self.problems.push(format!("{}: {e}", self.searches[i].site().name()));
 					failed.push(i);
@@ -153,6 +163,11 @@ impl MultiSearch {
 		}
 		if self.searches.is_empty() {
 			return Err(Error::Query(format!("Every site failed. {}", self.problems.join(" "))));
+		}
+		// Nothing came back and every site still going failed: say so now, though
+		// they all get another try.
+		if batches.is_empty() && !errors.is_empty() && self.searches.iter().all(|s| s.done() || s.strikes > 0) {
+			return Err(Error::Query(format!("Every site failed; trying again may work. {}", errors.join(" "))));
 		}
 
 		let mut out = Vec::new();

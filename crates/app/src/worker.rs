@@ -56,6 +56,9 @@ pub struct Worker {
 	/// For loading GIFs and videos, one thread each.
 	tx: Sender<Msg>,
 	ctx: egui::Context,
+	/// The GIF or video the window is waiting for, if any. A download for
+	/// anything else stops instead of filling memory nobody will look at.
+	wanted: Arc<Mutex<String>>,
 }
 
 impl Worker {
@@ -106,7 +109,7 @@ impl Worker {
 			});
 		}
 
-		Worker { jobs, suggest, images, msgs, tx: msg_tx, ctx }
+		Worker { jobs, suggest, images, msgs, tx: msg_tx, ctx, wanted: Arc::default() }
 	}
 
 	pub fn send(&self, job: Job) {
@@ -134,7 +137,7 @@ impl Worker {
 			for (host, header, ua, _) in crate::cookies::harvest(&hosts) {
 				bettersearch_core::sites::set_cookie_as(&host, &header, &ua);
 				if let Ok(s) = store.lock() {
-					let _ = s.set_cookie(&host, &header);
+					let _ = s.set_cookie(&host, &header, &ua);
 				}
 			}
 			ctx.request_repaint();
@@ -255,20 +258,45 @@ impl Worker {
 		});
 	}
 
+	/// Which GIF or video the window still wants, if any; set every frame.
+	pub fn want_media(&self, url: Option<&str>) {
+		let mut wanted = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
+		if wanted.as_str() != url.unwrap_or_default() {
+			*wanted = url.unwrap_or_default().to_string();
+		}
+	}
+
 	pub fn media(&self, site: Arc<dyn Site>, url: String, video: bool) {
-		let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+		self.want_media(Some(&url));
+		let (tx, ctx, wanted) = (self.tx.clone(), self.ctx.clone(), self.wanted.clone());
 		std::thread::spawn(move || {
+			let keep = || *wanted.lock().unwrap_or_else(|e| e.into_inner()) == url;
 			// A video starts once its first part is in; the rest follows.
 			let msg = if video {
-				let video = site.fetch_stream(&url).map_err(|e| e.to_string()).and_then(Video::stream);
-				Msg::Video { url, video: video.map(Box::new) }
+				let video = site.fetch_stream(&url).map_err(|e| e.to_string()).and_then(|from| Video::stream_while(from, &keep));
+				Msg::Video { url: url.clone(), video: video.map(Box::new) }
 			} else {
-				let bytes = site.fetch_bytes(&url).map_err(|e| e.to_string());
-				Msg::Animation { url, frames: bytes.and_then(|b| media::decode_animation(&b)) }
+				let bytes = site.fetch_stream(&url).map_err(|e| e.to_string()).and_then(|from| read_while(from, &keep));
+				Msg::Animation { url: url.clone(), frames: bytes.and_then(|b| media::decode_animation(&b)) }
 			};
 			let _ = tx.send(msg);
 			ctx.request_repaint();
 		});
+	}
+}
+
+/// All of a download, unless `keep` turns false first.
+fn read_while(mut from: Box<dyn std::io::Read + Send>, keep: &dyn Fn() -> bool) -> Result<Vec<u8>, String> {
+	let (mut out, mut buf) = (Vec::new(), vec![0u8; 64 * 1024]);
+	loop {
+		if !keep() {
+			return Err("no longer wanted".into());
+		}
+		match from.read(&mut buf) {
+			Ok(0) => return Ok(out),
+			Ok(n) => out.extend_from_slice(&buf[..n]),
+			Err(e) => return Err(format!("download stopped: {e}")),
+		}
 	}
 }
 

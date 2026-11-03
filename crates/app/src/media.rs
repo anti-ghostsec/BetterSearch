@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::egui::{self, ColorImage};
-use image::AnimationDecoder;
+use image::{AnimationDecoder, ImageDecoder};
 
 /// Frames are scaled down to this width at most.
 const MAX_WIDTH: u32 = 1280;
@@ -26,32 +26,63 @@ const MAX_WIDTH: u32 = 1280;
 const START_AFTER: usize = 2 * 1024 * 1024;
 #[cfg(test)]
 const START_AFTER: usize = 8 * 1024;
+/// Runs in a row that may end without a frame before a video is given up on:
+/// one for the graphics card failing, more for anything else.
+const MAX_EMPTY_RUNS: u32 = 3;
 /// Animations stop adding frames past this much memory.
 const MAX_ANIMATION_BYTES: usize = 400 * 1024 * 1024;
 
 /// An animation's frames and how long each shows, in milliseconds.
 pub type Frames = Vec<(ColorImage, u32)>;
 
+/// Animation canvases larger than this many pixels aren't decoded: every
+/// frame is drawn at full canvas size before it is scaled down.
+const MAX_CANVAS_PIXELS: u64 = 4096 * 4096;
+
 /// All frames of an animated GIF or WebP. A still image gives one frame.
 pub fn decode_animation(bytes: &[u8]) -> Result<Frames, String> {
-	let frames: Vec<image::Frame> = match image::guess_format(bytes).map_err(|e| e.to_string())? {
-		image::ImageFormat::Gif => image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
-			.and_then(|d| d.into_frames().collect_frames())
-			.map_err(|e| e.to_string())?,
+	match image::guess_format(bytes).map_err(|e| e.to_string())? {
+		image::ImageFormat::Gif => {
+			let d = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+			check_canvas(d.dimensions())?;
+			scale_frames(d.into_frames())
+		}
 		image::ImageFormat::WebP => {
 			let d = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+			check_canvas(d.dimensions())?;
 			if d.has_animation() {
-				d.into_frames().collect_frames().map_err(|e| e.to_string())?
+				scale_frames(d.into_frames())
 			} else {
 				let still = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
-				vec![image::Frame::new(still.to_rgba8())]
+				scale_frames(image::Frames::new(Box::new(std::iter::once(Ok(image::Frame::new(still.to_rgba8()))))))
 			}
 		}
-		_ => vec![image::Frame::new(image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgba8())],
-	};
+		_ => {
+			let still = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+			scale_frames(image::Frames::new(Box::new(std::iter::once(Ok(image::Frame::new(still.to_rgba8()))))))
+		}
+	}
+}
+
+fn check_canvas((w, h): (u32, u32)) -> Result<(), String> {
+	if w as u64 * h as u64 > MAX_CANVAS_PIXELS {
+		return Err(format!("animation too large to play ({w}×{h})"));
+	}
+	Ok(())
+}
+
+/// Decodes frames one at a time, scaling each down as it comes, so memory
+/// stops at `MAX_ANIMATION_BYTES` instead of holding every full-size frame.
+fn scale_frames(frames: image::Frames<'_>) -> Result<Frames, String> {
 	let mut out = Vec::new();
 	let mut used = 0;
 	for f in frames {
+		let f = match f {
+			Ok(f) => f,
+			// A broken frame late in the file: play what came before it.
+			Err(_) if !out.is_empty() => break,
+			Err(e) => return Err(e.to_string()),
+		};
 		let (num, den) = f.delay().numer_denom_ms();
 		// Browsers show "as fast as possible" (0 or 10 ms) frames at 100 ms; so do we.
 		let ms = num.checked_div(den).unwrap_or(100);
@@ -143,6 +174,10 @@ pub struct Video {
 	/// Where the current run started, and frames shown since.
 	start: f64,
 	frames: Arc<AtomicU64>,
+	/// Which run is current. A stopped run's reader thread can still be
+	/// draining its pipe; it checks this so it can't count frames for, or end,
+	/// the run that replaced it.
+	run: Arc<AtomicU64>,
 	/// The newest frame and its number, for the window to show.
 	latest: Arc<Mutex<Option<(u64, ColorImage)>>>,
 	ended: Arc<AtomicBool>,
@@ -158,6 +193,9 @@ pub struct Video {
 	/// did and showed nothing (then the processor does it from there on).
 	on_card: bool,
 	card_failed: bool,
+	/// Runs in a row that ended without a single frame. After a few, it's
+	/// given up on rather than restarted forever.
+	empty_runs: u32,
 }
 
 impl Video {
@@ -165,22 +203,38 @@ impl Video {
 	/// and streams, and returns once it can start: after the first couple of
 	/// MB, or after all of it for an MP4 that keeps its index at the end. The
 	/// rest comes in behind it.
-	pub fn stream(mut from: Box<dyn Read + Send>) -> Result<Video, String> {
+	#[cfg(test)]
+	pub fn stream(from: Box<dyn Read + Send>) -> Result<Video, String> {
+		Self::stream_while(from, &|| true)
+	}
+
+	/// `stream`, giving up (and letting go of what came) as soon as `keep`
+	/// turns false: the window moved on to another post before this one could
+	/// start. After it starts, dropping the `Video` stops the download.
+	pub fn stream_while(mut from: Box<dyn Read + Send>, keep: &dyn Fn() -> bool) -> Result<Video, String> {
 		// Asked here, off the window's thread, so playing never waits on it.
 		hw_decoder();
 		let mut v = Video::empty()?;
 		let mut file = v.writer()?;
 		let mut buf = vec![0u8; 64 * 1024];
 		let (mut have, mut done) = (0, false);
-		while have < START_AFTER && !done {
+		let mut read = |file: &mut std::fs::File, done: &mut bool| -> Result<usize, String> {
+			if !keep() {
+				return Err("no longer wanted".into());
+			}
 			let n = from.read(&mut buf).map_err(|e| format!("download stopped: {e}"))?;
 			file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-			have += n;
-			done = n == 0;
+			*done = n == 0;
+			Ok(n)
+		};
+		while have < START_AFTER && !done {
+			have += read(&mut file, &mut done)?;
 		}
+		// An MP4 with its index at the end can't start until all of it is in.
 		if !done && v.probe().is_err() {
-			std::io::copy(&mut from, &mut file).map_err(|e| format!("download stopped: {e}"))?;
-			done = true;
+			while !done {
+				read(&mut file, &mut done)?;
+			}
 		}
 		if done {
 			v.loaded.store(true, Ordering::SeqCst);
@@ -223,6 +277,7 @@ impl Video {
 			child: None,
 			start: 0.0,
 			frames: Arc::new(AtomicU64::new(0)),
+			run: Arc::new(AtomicU64::new(0)),
 			latest: Arc::new(Mutex::new(None)),
 			ended: Arc::new(AtomicBool::new(false)),
 			out: (0, 0),
@@ -231,6 +286,7 @@ impl Video {
 			feeding: None,
 			on_card: false,
 			card_failed: false,
+			empty_runs: 0,
 		})
 	}
 
@@ -309,9 +365,21 @@ impl Video {
 	/// Plays from `at` seconds: ffmpeg decodes at the video's own pace, sends
 	/// frames here and the sound to the speakers.
 	pub fn play_from(&mut self, at: f64, ctx: &egui::Context) {
+		// Whether ffmpeg quit by itself, rather than being stopped for a pause or seek.
+		let quit = self.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
 		self.stop();
-		if self.on_card && self.ended.load(Ordering::SeqCst) && self.frames.load(Ordering::SeqCst) == 0 {
+		let shown = self.frames.load(Ordering::SeqCst);
+		if self.on_card && self.ended.load(Ordering::SeqCst) && shown == 0 {
 			self.card_failed = true;
+		}
+		if quit && shown == 0 {
+			self.empty_runs += 1;
+		} else if shown > 0 {
+			self.empty_runs = 0;
+		}
+		if self.broken() {
+			self.ended.store(true, Ordering::SeqCst);
+			return;
 		}
 		self.paused = false;
 		self.start = at.max(0.0);
@@ -366,14 +434,18 @@ impl Video {
 		}
 		let mut out = child.stdout.take().expect("piped");
 		let (latest, frames, ended, ctx) = (self.latest.clone(), self.frames.clone(), self.ended.clone(), ctx.clone());
+		let (run, this) = (self.run.clone(), self.run.fetch_add(1, Ordering::SeqCst) + 1);
 		std::thread::spawn(move || {
 			let mut buf = vec![0u8; w as usize * h as usize * 4];
-			while out.read_exact(&mut buf).is_ok() {
+			while out.read_exact(&mut buf).is_ok() && run.load(Ordering::SeqCst) == this {
 				let n = frames.fetch_add(1, Ordering::SeqCst) + 1;
 				*latest.lock().unwrap() = Some((n, ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &buf)));
 				ctx.request_repaint();
 			}
-			ended.store(true, Ordering::SeqCst);
+			// Only the current run ends the video; a replaced one just stops.
+			if run.load(Ordering::SeqCst) == this {
+				ended.store(true, Ordering::SeqCst);
+			}
 			ctx.request_repaint();
 		});
 		self.child = Some(child);
@@ -383,6 +455,12 @@ impl Video {
 	pub fn position(&self) -> f64 {
 		let p = self.start + self.frames.load(Ordering::SeqCst) as f64 / self.fps;
 		if self.duration > 0.0 { p.min(self.duration) } else { p }
+	}
+
+	/// Whether ffmpeg keeps stopping before showing anything (a codec it can
+	/// read but not decode, say): then it isn't started again.
+	pub fn broken(&self) -> bool {
+		self.empty_runs >= MAX_EMPTY_RUNS
 	}
 
 	/// Whether it played to the end (to loop it).
@@ -428,6 +506,9 @@ impl Video {
 	}
 
 	fn stop(&mut self) {
+		// The run's reader thread may still be draining its pipe: from here on
+		// it counts for nothing.
+		self.run.fetch_add(1, Ordering::SeqCst);
 		if let Some(over) = self.feeding.take() {
 			over.store(true, Ordering::SeqCst);
 		}
@@ -500,6 +581,18 @@ mod tests {
 		assert!(decode_animation(b"not an image").is_err());
 	}
 
+	/// A GIF of a few bytes can claim a huge canvas, and every frame would be
+	/// drawn at that size: it's refused before any frame is decoded.
+	#[test]
+	fn refuses_a_huge_gif_canvas() {
+		let mut gif = b"GIF89a".to_vec();
+		gif.extend(20000u16.to_le_bytes());
+		gif.extend(20000u16.to_le_bytes());
+		gif.extend([0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+		gif.extend([b',', 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0, b';']);
+		assert!(decode_animation(&gif).unwrap_err().contains("too large"));
+	}
+
 	#[test]
 	fn finds_the_card_programs_are_pointed_at() {
 		assert_eq!(prime_node("pci-0000_0a_00_0").as_deref(), Some("/dev/dri/by-path/pci-0000:0a:00.0-render"));
@@ -526,6 +619,52 @@ mod tests {
 			self.at += n;
 			Ok(n)
 		}
+	}
+
+	/// ffmpeg that quits before the first frame every time (here: an empty
+	/// file) is started a few times, then not again, instead of on every repaint.
+	#[test]
+	fn gives_up_on_a_video_that_never_shows_a_frame() {
+		if !can_play_video() {
+			return;
+		}
+		let mut v = Video::empty().unwrap();
+		v.loaded.store(true, Ordering::SeqCst);
+		(v.width, v.height, v.out) = (16, 16, (16, 16));
+		let ctx = egui::Context::default();
+		let mut runs = 0;
+		while !v.broken() && runs < 10 {
+			v.play_from(0.0, &ctx);
+			runs += 1;
+			let t = std::time::Instant::now();
+			while !v.ended() && t.elapsed().as_secs() < 10 {
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			}
+			// Let the process finish exiting, so it reads as having quit.
+			std::thread::sleep(std::time::Duration::from_millis(100));
+		}
+		assert!(v.broken(), "still restarting after {runs} runs");
+		assert_eq!(runs, MAX_EMPTY_RUNS + 1);
+		v.play_from(0.0, &ctx);
+		assert!(v.child.is_none() && v.ended());
+	}
+
+	/// The window moved on before the video could start: the download stops.
+	#[test]
+	fn stops_downloading_a_video_nobody_wants() {
+		let reads = Arc::new(AtomicU64::new(0));
+		struct Endless(Arc<AtomicU64>);
+		impl Read for Endless {
+			fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+				self.0.fetch_add(1, Ordering::SeqCst);
+				buf.fill(0);
+				Ok(buf.len())
+			}
+		}
+		let seen = reads.clone();
+		let got = Video::stream_while(Box::new(Endless(reads.clone())), &move || seen.load(Ordering::SeqCst) < 3);
+		assert_eq!(got.err().as_deref(), Some("no longer wanted"));
+		assert_eq!(reads.load(Ordering::SeqCst), 3);
 	}
 
 	/// A video starts before it has all arrived, plays on as the rest comes in,
@@ -572,7 +711,7 @@ mod tests {
 				resumed = Some(v.start);
 			}
 		}
-		assert!(v.loaded() && v.ended());
+		assert!(v.loaded() && v.ended(), "loaded {} ended {} after {:?}, first {first:?}, resumed {resumed:?}, broken {}", v.loaded(), v.ended(), t.elapsed(), v.broken());
 		// The first frame came while it was still downloading, and the end came at the end.
 		assert!(first.is_some_and(|(_, loaded)| !loaded), "first frame at {first:?}");
 		assert!(t.elapsed().as_secs_f64() < 5.0, "{:?}", t.elapsed());

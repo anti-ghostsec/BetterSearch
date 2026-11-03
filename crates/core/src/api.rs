@@ -76,18 +76,24 @@ fn head(raw: &[u8]) -> Result<(&str, &[u8], usize), ParseError> {
 	Ok((text, &raw[end + 4..], end + 4))
 }
 
+fn hex(b: u8) -> Option<u8> {
+	(b as char).to_digit(16).map(|d| d as u8)
+}
+
 fn percent_decode(s: &str) -> String {
 	let bytes = s.as_bytes();
 	let mut out = Vec::with_capacity(bytes.len());
 	let mut i = 0;
 	while i < bytes.len() {
 		match bytes[i] {
-			b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-				Ok(b) => {
-					out.push(b);
+			// Bytes, not a slice of the str: `%a` before a multi-byte letter
+			// would cut it in half and panic.
+			b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+				(Some(hi), Some(lo)) => {
+					out.push(hi << 4 | lo);
 					i += 3;
 				}
-				Err(_) => {
+				_ => {
 					out.push(b'%');
 					i += 1;
 				}
@@ -416,6 +422,7 @@ pub fn handle(req: &Request, cx: &Context<'_>) -> Response {
 					let mut out = Vec::new();
 					for c in list.chars().filter(|c| *c != ',') {
 						match Rating::from_name(&c.to_string()) {
+							Some(r) if out.contains(&r) => {}
 							Some(r) => out.push(r),
 							None => return Response::error(400, &format!("unknown rating {c:?}: use s, q, e")),
 						}
@@ -669,6 +676,20 @@ mod tests {
 		assert_eq!(body["ratings"], json!(["s", "q"]));
 		let r = handle(&get("/api/v1/search?q=fox&ratings=s,x", "Bearer secret"), &cx(&l, true, &b));
 		assert_eq!(r.status, 400);
+		let r = handle(&get("/api/v1/search?q=fox&ratings=ss", "Bearer secret"), &cx(&l, true, &b));
+		assert_eq!(r.status, 200);
+		let body: Value = serde_json::from_slice(&r.body).unwrap();
+		assert_eq!(body["ratings"], json!(["s"]));
+	}
+
+	/// A `%` before a letter that takes several bytes used to cut the letter
+	/// in half and panic, before the token was even looked at.
+	#[test]
+	fn percent_escapes_never_panic() {
+		assert_eq!(percent_decode("%aé"), "%aé");
+		assert_eq!(percent_decode("%é%"), "%é%");
+		assert_eq!(percent_decode("fox%20%28x%29+y"), "fox (x) y");
+		assert_eq!(percent_decode("%zz%4"), "%zz%4");
 	}
 
 	#[test]

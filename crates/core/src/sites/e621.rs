@@ -83,11 +83,17 @@ impl E621 {
 		let mut swapped = false;
 		let res = loop {
 			self.throttle.wait();
-			let mut req = super::with_cookie(self.client.get(&url), &url).query(query);
-			if let Some(ua) = &other_ua {
-				req = req.header(reqwest::header::COOKIE, super::cookie_for(&url).map(|c| c.0).unwrap_or_default());
-				req = req.header(reqwest::header::USER_AGENT, ua.as_str());
+			// One Cookie and one User-Agent header either way: reqwest appends, so
+			// the swapped UA can't go on top of `with_cookie`'s.
+			let mut req = match &other_ua {
+				Some(ua) => self
+					.client
+					.get(&url)
+					.header(reqwest::header::COOKIE, super::cookie_for(&url).map(|c| c.0).unwrap_or_default())
+					.header(reqwest::header::USER_AGENT, ua.as_str()),
+				None => super::with_cookie(self.client.get(&url), &url),
 			}
+			.query(query);
 			if let Some((u, k)) = &self.login {
 				req = req.basic_auth(u, Some(k));
 			}
@@ -98,7 +104,8 @@ impl E621 {
 				continue;
 			}
 			// A challenge page, and a cookie to try the other way round.
-			if res.status().is_success() && !swapped {
+			// Challenges come back as 403 as often as 200.
+			if (res.status().is_success() || res.status() == reqwest::StatusCode::FORBIDDEN) && !swapped {
 				let html = res.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.contains("html"));
 				if html && let Some((_, ua)) = super::other_cookie_ua(&url) {
 					swapped = true;

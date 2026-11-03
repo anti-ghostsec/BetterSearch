@@ -139,7 +139,8 @@ impl Store {
 			CREATE TABLE IF NOT EXISTS cookies (
 				host TEXT PRIMARY KEY,
 				header TEXT NOT NULL,
-				at INTEGER NOT NULL
+				at INTEGER NOT NULL,
+				ua TEXT NOT NULL DEFAULT ''
 			);
 			CREATE TABLE IF NOT EXISTS history (
 				id INTEGER PRIMARY KEY,
@@ -148,6 +149,10 @@ impl Store {
 				at INTEGER NOT NULL
 			);",
 		)?;
+		// Cookies kept before the UA was: the column comes in empty.
+		if conn.prepare("SELECT ua FROM cookies LIMIT 0").is_err() {
+			conn.execute_batch("ALTER TABLE cookies ADD COLUMN ua TEXT NOT NULL DEFAULT ''")?;
+		}
 		let opts = Options::default();
 		TagGraph::migrate(&conn, &opts)?;
 		Ok(Store { conn, opts, actor: "local".into(), aliases: HashMap::new(), counts: HashMap::new(), auto_links: true })
@@ -226,19 +231,21 @@ impl Store {
 		Ok(rows.filter_map(|r| r.ok().and_then(|j| serde_json::from_str(&j).ok())).collect())
 	}
 
-	/// Borrowed browser cookies, by host.
-	pub fn set_cookie(&self, host: &str, header: &str) -> Result<()> {
+	/// Borrowed browser cookies, by host, with the User-Agent they were earned
+	/// under: a clearance cookie sent with any other UA is refused.
+	pub fn set_cookie(&self, host: &str, header: &str, ua: &str) -> Result<()> {
 		self.conn.execute(
-			"INSERT INTO cookies (host, header, at) VALUES (?, ?, unixepoch())
-			ON CONFLICT (host) DO UPDATE SET header = excluded.header, at = excluded.at",
-			rusqlite::params![host, header],
+			"INSERT INTO cookies (host, header, ua, at) VALUES (?, ?, ?, unixepoch())
+			ON CONFLICT (host) DO UPDATE SET header = excluded.header, ua = excluded.ua, at = excluded.at",
+			rusqlite::params![host, header, ua],
 		)?;
 		Ok(())
 	}
 
-	pub fn cookies(&self) -> Result<Vec<(String, String, i64)>> {
-		let mut st = self.conn.prepare_cached("SELECT host, header, at FROM cookies")?;
-		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+	/// Host, Cookie header, UA (empty for cookies kept before it was) and when.
+	pub fn cookies(&self) -> Result<Vec<(String, String, String, i64)>> {
+		let mut st = self.conn.prepare_cached("SELECT host, header, ua, at FROM cookies")?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
 		Ok(rows.collect::<rusqlite::Result<_>>()?)
 	}
 
@@ -1004,6 +1011,21 @@ mod tests {
 		assert_eq!(h, vec!["fox (smile | grin)", "wolf"]);
 		assert_eq!(back.history_tags(2).unwrap(), vec![("fox".into(), 1), ("grin".into(), 1)]);
 		assert!(back.graph().link_names().unwrap().contains(&"relation".to_string()));
+	}
+
+	/// A cookie comes back with the UA it was earned under, and a database
+	/// from before the UA was kept gains the column, empty.
+	#[test]
+	fn cookies_keep_their_user_agent() {
+		let s = Store::in_memory().unwrap();
+		s.set_cookie("x.test", "cf_clearance=1", "WebKit UA").unwrap();
+		assert_eq!(s.cookies().unwrap()[0].2, "WebKit UA");
+
+		let conn = Connection::open_in_memory().unwrap();
+		conn.execute_batch("CREATE TABLE cookies (host TEXT PRIMARY KEY, header TEXT NOT NULL, at INTEGER NOT NULL);
+			INSERT INTO cookies VALUES ('old.test', 'a=1', 0);").unwrap();
+		let old = Store::with(conn).unwrap();
+		assert_eq!(old.cookies().unwrap(), vec![("old.test".into(), "a=1".into(), String::new(), 0)]);
 	}
 
 	#[test]

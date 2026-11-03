@@ -80,7 +80,9 @@ pub struct Search {
 	fetched: usize,
 	/// The empty-result note is added once, not every page.
 	named_missing: bool,
-
+	/// Calls to `next` in a row that ended in an error; a multi-site search
+	/// gives up on the site after a second one.
+	pub(crate) strikes: u8,
 }
 
 /// A post with its query's vouched tags counted as on it. Without this, a
@@ -204,13 +206,14 @@ fn join_tags(expr: Expr, counts: &HashMap<String, u64>, least: u64) -> (Expr, Ve
 
 pub(crate) fn rating_filter(ratings: &[Rating]) -> Result<Option<Expr>> {
 	let meta = |r: Rating| Expr::Meta { key: "rating".into(), value: r.letter().to_string() };
-	let missing: Vec<Rating> = Rating::ALL.into_iter().filter(|r| !ratings.contains(r)).collect();
-	match (ratings.len(), missing.as_slice()) {
-		(0, _) => Err(Error::Query("Tick at least one rating.".into())),
+	// Counted as a set: a rating named twice is still one rating.
+	let (wanted, missing): (Vec<Rating>, Vec<Rating>) = Rating::ALL.into_iter().partition(|r| ratings.contains(r));
+	match (wanted.as_slice(), missing.as_slice()) {
+		([], _) => Err(Error::Query("Tick at least one rating.".into())),
 		(_, []) => Ok(None),
-		(1, _) => Ok(Some(meta(ratings[0]))),
+		([one], _) => Ok(Some(meta(*one))),
 		(_, [m]) => Ok(Some(Expr::Not(Box::new(meta(*m))))),
-		_ => unreachable!(),
+		_ => unreachable!("three ratings: one or two wanted means one or two missing"),
 	}
 }
 
@@ -357,6 +360,7 @@ impl Search {
 			checked: 0,
 			fetched: 0,
 			named_missing: false,
+			strikes: 0,
 		})
 	}
 
@@ -483,7 +487,15 @@ impl Search {
 					// here: a full page finds the rest in fewer requests.
 					let need = if *made == 0 { want - out.len() } else { page_size };
 					*made += 1;
-					self.fetch(i, need, store)?;
+					// What already matched isn't thrown away with the error: it comes
+					// back now, and the failed page (its cursor didn't move) is asked
+					// for again next time, which reports the error if it fails again.
+					if let Err(e) = self.fetch(i, need, store) {
+						if out.is_empty() {
+							return Err(e);
+						}
+						break 'outer;
+					}
 				}
 			}
 			let pick = if self.plan.ordered {
@@ -504,11 +516,21 @@ impl Search {
 				continue;
 			}
 			self.checked += 1;
-			let keep = {
-				let s = store.lock().unwrap();
-				let subject = s.subject(&post)?;
-				self.plan.filter.matches(&Vouched { subject: &subject, tags: &self.streams[i].vouched })
+			let subject = store.lock().unwrap().subject(&post);
+			let subject = match subject {
+				Ok(subject) => subject,
+				// Put back unchecked, so it isn't lost with the error.
+				Err(e) => {
+					self.seen.remove(&post.id);
+					self.checked -= 1;
+					self.streams[i].buf.push_front(post);
+					if out.is_empty() {
+						return Err(e);
+					}
+					break;
+				}
 			};
+			let keep = self.plan.filter.matches(&Vouched { subject: &subject, tags: &self.streams[i].vouched });
 			if keep {
 				out.push(post);
 			}
@@ -545,17 +567,18 @@ impl Search {
 			_ => need.max(MIN_LIMIT).min(page_size),
 		};
 		let page = self.site.search(&s.query, s.next, limit)?;
-		if !s.started {
-			s.limit = limit;
-		}
-		s.started = true;
-		s.next = page.next;
 		{
 			let st = store.lock().unwrap();
 			st.save_posts(&page.posts)?;
 			// Before the check, so searches for links see filled-in ones too.
 			st.auto_link(&page.posts)?;
 		}
+		// Only once the page is kept: a failure above asks for it again.
+		if !s.started {
+			s.limit = limit;
+		}
+		s.started = true;
+		s.next = page.next;
 		let sent = page.posts.len();
 		s.buf.extend(page.posts);
 		self.fetched += sent;
@@ -667,6 +690,8 @@ mod tests {
 	struct Fake {
 		posts: Vec<Post>,
 		calls: Mutex<Vec<String>>,
+		/// The search call (counting from 1) that fails, once.
+		fail_call: Mutex<Option<usize>>,
 	}
 
 	fn post(id: u64, tags: &[&str]) -> Post {
@@ -707,7 +732,14 @@ mod tests {
 			Capabilities { max_tags: 2, tilde_or: false, max_wildcards: 1, metas: &["rating"], free_metas: &[], page_size: 2 }
 		}
 		fn search(&self, query: &str, cursor: Option<Cursor>, limit: usize) -> Result<Page> {
-			self.calls.lock().unwrap().push(format!("{query} {cursor:?}"));
+			let mut calls = self.calls.lock().unwrap();
+			calls.push(format!("{query} {cursor:?}"));
+			let mut fail = self.fail_call.lock().unwrap();
+			if *fail == Some(calls.len()) {
+				*fail = None;
+				return Err(Error::Query("timed out".into()));
+			}
+			drop((calls, fail));
 			let want: Vec<&str> = query.split_whitespace().filter(|w| !w.contains(':') && !w.starts_with('-')).collect();
 			let before = match cursor {
 				Some(Cursor::Before(id)) => id,
@@ -736,6 +768,7 @@ mod tests {
 		Arc::new(Fake {
 			posts: vec![post(1, &["a"]), post(2, &["b"]), post(3, &["a", "c"]), post(4, &["b", "c"]), post(5, &["a"]), post(6, &["b", "c"])],
 			calls: Mutex::new(vec![]),
+			fail_call: Mutex::new(None),
 		})
 	}
 
@@ -750,6 +783,20 @@ mod tests {
 		let mut s = Search::start(site.clone(), "a | b", &Rating::ALL, &store).unwrap();
 		assert_eq!(s.plan.queries, vec!["a", "b"]);
 		assert_eq!(ids(&s.next(10, &store).unwrap()), vec![6, 5, 4, 3, 2, 1]);
+		assert!(s.done());
+	}
+
+	/// The second page fails after the first one matched: those matches come
+	/// back, and the failed page is asked for again on the next call.
+	#[test]
+	fn a_failed_page_keeps_what_already_matched() {
+		let site = fake();
+		*site.fail_call.lock().unwrap() = Some(2);
+		let store = Mutex::new(Store::in_memory().unwrap());
+		let mut s = Search::start(site.clone(), "c", &Rating::ALL, &store).unwrap();
+		assert_eq!(ids(&s.next(10, &store).unwrap()), vec![6, 4]);
+		assert!(!s.done());
+		assert_eq!(ids(&s.next(10, &store).unwrap()), vec![3]);
 		assert!(s.done());
 	}
 
@@ -802,6 +849,8 @@ mod tests {
 		assert_eq!(rating_filter(&[Rating::Safe, Rating::Questionable]).unwrap().unwrap().to_string(), "-rating:e");
 		assert!(rating_filter(&Rating::ALL).unwrap().is_none());
 		assert!(rating_filter(&[]).is_err());
+		// Named twice is still one: this used to reach `unreachable!`.
+		assert_eq!(rating_filter(&[Rating::Safe, Rating::Safe]).unwrap().unwrap().to_string(), "rating:s");
 	}
 
 	/// A site whose posts carry exactly the tags searched for (each query gets
