@@ -1,3 +1,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/app"]
+
+# Debug info: file and line numbers for our code, none for dependencies,
+# or the build folder grows by tens of gigabytes.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
